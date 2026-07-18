@@ -9,7 +9,9 @@ from __future__ import annotations
 import re
 
 WAKE_WORD = "Шарп"
-_WAKE_RE = re.compile(r"(?iu)(?<![\w-])(?:шарп|sharp)(?![\w-])")
+# Google STT иногда проглатывает последнюю согласную и возвращает «шар».
+# Принимаем только отдельное слово, поэтому «шарик» не активирует ассистента.
+_WAKE_RE = re.compile(r"(?iu)(?<![\w-])(?:шарп|шар|sharp)(?![\w-])")
 _SEPARATORS_RE = re.compile(r"^[\s,.:;!?—–-]+|[\s,.:;!?—–-]+$")
 
 
@@ -26,4 +28,4 @@ def extract_command(transcript: str) -> str | None:
     before = _SEPARATORS_RE.sub("", transcript[: match.start()])
     after = _SEPARATORS_RE.sub("", transcript[match.end() :])
     command = " ".join(part for part in (before, after) if part).strip()
-    return command or "Слушай меня"
+    return command

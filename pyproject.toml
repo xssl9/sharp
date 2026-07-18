@@ -10,6 +10,7 @@ dependencies = [
     "sounddevice>=0.4.6",
     "numpy>=1.24",
     "SpeechRecognition>=3.10",
+    "webrtcvad-wheels>=2.0.14",
 ]
 
 [project.optional-dependencies]

@@ -7,8 +7,10 @@ from __future__ import annotations
 
 import re
 import threading
+import time
 from pathlib import Path
 
+import numpy as np
 from rich.markup import escape
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -20,6 +22,8 @@ from ..assistant import Assistant
 from ..config import CFG, VOICES
 from ..wake import WAKE_WORD, extract_command
 from .visualizer import Visualizer
+
+DIALOG_WINDOW_SECONDS = 12.0
 
 
 class SharpApp(App):
@@ -38,6 +42,7 @@ class SharpApp(App):
         self._busy = threading.Event()
         self._shutdown_event = threading.Event()
         self._mic_worker_started = False
+        self._awake_until = 0.0
         self.live = None        # LiveSession, если активен реалтайм-режим
 
     def compose(self) -> ComposeResult:
@@ -89,6 +94,31 @@ class SharpApp(App):
         }
         self.log_line(f"{labels.get(role, '[#707070]SYS[/]   ')}{escape(text)}")
 
+    def _log_live_reply(self, text: str) -> None:
+        self._awake_until = time.monotonic() + DIALOG_WINDOW_SECONDS
+        self.log_message("sharp", text)
+
+    def _acknowledge_wake(self) -> None:
+        """Instant local acknowledgement; no Gemini/network round trip."""
+        if self._busy.is_set():
+            return
+        self._busy.set()
+        self.call_from_thread(self.set_status, "LISTENING")
+        self.call_from_thread(self.log_message, "sharp", "Слушаю, сэр.")
+        try:
+            if not self.muted:
+                rate = audio.TTS_SAMPLE_RATE
+                first = np.sin(2 * np.pi * 880 * np.arange(int(rate * 0.07)) / rate)
+                second = np.sin(2 * np.pi * 1175 * np.arange(int(rate * 0.10)) / rate)
+                pause = np.zeros(int(rate * 0.025))
+                tone = np.concatenate((first, pause, second)) * 0.16
+                pcm = (tone * 32767).astype(np.int16).tobytes()
+                audio.play_pcm_blocking(pcm)
+        finally:
+            self._awake_until = time.monotonic() + DIALOG_WINDOW_SECONDS
+            self._busy.clear()
+            self.call_from_thread(self.set_status, "LISTENING")
+
     def _ensure_mic_worker(self) -> None:
         if self._mic_worker_started:
             return
@@ -101,7 +131,7 @@ class SharpApp(App):
         self.mic_on = False  # классический цикл молчит, пока Live активен
         self.live = LiveSession(
             on_user_text=lambda t: self.call_from_thread(self.log_message, "voice", t),
-            on_sharp_text=lambda t: self.call_from_thread(self.log_message, "sharp", t),
+            on_sharp_text=lambda t: self.call_from_thread(self._log_live_reply, t),
             on_status=lambda t: self.call_from_thread(self._live_status, t),
             capture_audio=False,
         )
@@ -270,7 +300,7 @@ class SharpApp(App):
             self.log_line(f"[#f85149]Неизвестная команда: {cmd}. /help — список.")
 
     # --- обработка запроса + голос (в отдельном потоке) ---
-    def _respond(self, text: str) -> None:
+    def _respond(self, text: str, *, keep_awake: bool = False) -> None:
         if self._busy.is_set():
             return
         self._busy.set()
@@ -289,8 +319,13 @@ class SharpApp(App):
                 except Exception as e:  # noqa: BLE001
                     self.call_from_thread(self.log_line, f"[#f85149]Озвучка не удалась: {str(e)[:80]}")
         finally:
+            if keep_awake:
+                self._awake_until = time.monotonic() + DIALOG_WINDOW_SECONDS
             self._busy.clear()
-            state = f"SAY {WAKE_WORD.upper()}" if self.mic_on else "READY"
+            if self.mic_on and time.monotonic() < self._awake_until:
+                state = "LISTENING"
+            else:
+                state = f"SAY {WAKE_WORD.upper()}" if self.mic_on else "READY"
             self.call_from_thread(self.set_status, state)
 
     # --- микрофон: постоянный фоновый цикл (включён по умолчанию) ---
@@ -301,7 +336,6 @@ class SharpApp(App):
             self.call_from_thread(self.log_line, f"[#f85149]Микрофон недоступен: {str(e)[:80]}")
             self.mic_on = False
             return
-        import time
         while not self._shutdown_event.is_set():
             # не слушаем, пока Шарп думает/говорит или микрофон выключен
             if not self.mic_on or self._busy.is_set():
@@ -315,26 +349,53 @@ class SharpApp(App):
                 # Если ответ начался, прерываем уже открытый InputStream, чтобы
                 # он не успел записать и затем распознать голос самого Sharp.
                 cancel_event = live.speaking_event if live else self._busy
-                text = stt.listen_once(cancel_event=cancel_event)
+                awake = time.monotonic() < self._awake_until
+                max_seconds = stt.MAX_SPEECH_SECONDS if awake else stt.MAX_WAKE_SECONDS
+                candidates = stt.listen_candidates(
+                    cancel_event=cancel_event,
+                    max_speech_seconds=max_seconds,
+                )
             except Exception as e:  # noqa: BLE001
                 self.call_from_thread(self.log_line, f"[#f85149]Ошибка микрофона: {str(e)[:80]}")
                 time.sleep(1.0)
                 continue
-            if not text or self._busy.is_set() or not self.mic_on:
+            if not candidates or self._busy.is_set() or not self.mic_on:
+                if self.mic_on and time.monotonic() >= self._awake_until:
+                    self.call_from_thread(self.set_status, f"SAY {WAKE_WORD.upper()}")
                 continue
-            command = extract_command(text)
+            # Проверяем все альтернативы: wake-word часто бывает не в первом
+            # варианте Google STT. В активном окне берём лучший вариант без имени.
+            wake_match = None
+            for candidate in candidates:
+                extracted = extract_command(candidate)
+                if extracted is not None:
+                    wake_match = (candidate, extracted)
+                    break
+            if wake_match:
+                text, command = wake_match
+            elif time.monotonic() < self._awake_until:
+                text, command = candidates[0], candidates[0]
+            else:
+                self.call_from_thread(self.set_status, f"SAY {WAKE_WORD.upper()}")
+                continue
             if command is None:
                 continue
+            self._awake_until = time.monotonic() + DIALOG_WINDOW_SECONDS
+            self.call_from_thread(self.set_status, "LISTENING")
             self.call_from_thread(self.log_message, "voice", text)
+            if not command:
+                self._acknowledge_wake()
+                continue
+            request = command
             if self.live:
-                if not self.live.send_text(command):
+                if not self.live.send_text(request):
                     self.call_from_thread(
                         self._fallback_to_classic,
                         "Live не отвечает — включён классический голосовой режим.",
                     )
-                    self._respond(command)
+                    self._respond(request, keep_awake=True)
             else:
-                self._respond(command)
+                self._respond(request, keep_awake=True)
 
     def action_listen(self) -> None:
         if self.live:

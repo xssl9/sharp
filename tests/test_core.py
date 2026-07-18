@@ -1,19 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import tempfile
 import unittest
-import json
 from pathlib import Path
 from unittest.mock import patch
 
-from sharp import config
-from sharp import commands
+from sharp import commands, config
 from sharp.agent_sessions import AgentSession, list_codex_sessions
 from sharp.assistant import Assistant
 from sharp.commands import run_shell
 from sharp.live import LiveSession
 from sharp.storage import atomic_write_json
+from sharp.stt import _transcripts_from_google
 from sharp.wake import extract_command
 
 
@@ -236,7 +236,25 @@ class WakeWordTests(unittest.TestCase):
         self.assertEqual(extract_command("следующий трек, Sharp"), "следующий трек")
 
     def test_name_alone_wakes_assistant(self) -> None:
-        self.assertEqual(extract_command("Шарп!"), "Слушай меня")
+        self.assertEqual(extract_command("Шарп!"), "")
+
+    def test_common_stt_variant_is_accepted_as_whole_word(self) -> None:
+        self.assertEqual(extract_command("Шар включи музыку"), "включи музыку")
+        self.assertIsNone(extract_command("возьми шарик"))
+
+
+class SpeechRecognitionTests(unittest.TestCase):
+    def test_google_alternatives_are_preserved_for_wake_matching(self) -> None:
+        result = {
+            "alternative": [
+                {"transcript": "включи музыку", "confidence": 0.8},
+                {"transcript": "шарп включи музыку", "confidence": 0.7},
+            ]
+        }
+        self.assertEqual(
+            _transcripts_from_google(result),
+            ["включи музыку", "шарп включи музыку"],
+        )
 
 
 class NetworkProbeTests(unittest.TestCase):
