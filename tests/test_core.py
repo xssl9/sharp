@@ -224,6 +224,53 @@ class LiveSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.calls, 2)
         self.assertTrue(live._stop_async.is_set())
 
+    async def test_buffered_playback_waits_for_complete_turn(self) -> None:
+        class Content:
+            input_transcription = None
+            output_transcription = None
+            interrupted = False
+            turn_complete = False
+
+        class Response:
+            tool_call = None
+
+            def __init__(self, data: bytes | None, complete: bool = False) -> None:
+                self.data = data
+                self.server_content = Content()
+                self.server_content.turn_complete = complete
+
+        class Turn:
+            async def __aiter__(self):
+                yield Response(b"first")
+                yield Response(b"second", complete=True)
+
+        class Session:
+            def __init__(self) -> None:
+                self.called = False
+
+            def receive(self):
+                if self.called:
+                    raise RuntimeError("stop")
+                self.called = True
+                return Turn()
+
+        statuses: list[str] = []
+        live = LiveSession(
+            lambda _: None,
+            lambda _: None,
+            statuses.append,
+            buffered_playback=True,
+        )
+        live._running = True
+        live._session = Session()
+        live._stop_async = asyncio.Event()
+
+        await live._receiver()
+
+        self.assertEqual(live._play_q.get_nowait(), b"firstsecond")
+        self.assertTrue(live.speaking_event.is_set())
+        self.assertTrue(any("загружен" in status for status in statuses))
+
 
 class WakeWordTests(unittest.TestCase):
     def test_ambient_speech_is_ignored(self) -> None:

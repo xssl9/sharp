@@ -65,20 +65,18 @@ class SharpApp(App):
             self.set_status(f"SAY {WAKE_WORD.upper()}")
 
     def _probe_and_start(self) -> None:
-        """Проба сети: быстрая → Live, медленная → классический режим."""
+        """Проба сети выбирает потоковое или буферное воспроизведение Live."""
         from ..live import network_ok
         ok, ms = network_ok()
         shown = f"{ms:.0f}мс" if ms != float("inf") else "нет сети"
         if ok:
             self.call_from_thread(self.log_line, f"[#707070]SYS[/]   Сеть быстрая ({shown}) — Live-режим.")
-            self.call_from_thread(self._start_live)
+            self.call_from_thread(self._start_live, False)
         else:
             self.call_from_thread(self.log_line,
-                                  f"[#707070]SYS[/]   Сеть слабая ({shown}) — классический режим. "
-                                  "/live — попробовать Live вручную.")
-            self.mic_on = True
-            self.call_from_thread(self._ensure_mic_worker)
-            self.call_from_thread(self.set_status, f"SAY {WAKE_WORD.upper()}")
+                                  f"[#707070]SYS[/]   Сеть слабая ({shown}) — Live с полной "
+                                  "загрузкой ответа перед воспроизведением.")
+            self.call_from_thread(self._start_live, True)
 
     def set_status(self, state: str) -> None:
         self.query_one("#status", Static).update(state)
@@ -126,7 +124,7 @@ class SharpApp(App):
         self.run_worker(self._mic_loop, exclusive=False, thread=True)
 
     # --- реалтайм голос↔голос (Gemini Live API) ---
-    def _start_live(self) -> None:
+    def _start_live(self, buffered_playback: bool = False) -> None:
         from ..live import LiveSession
         self.mic_on = False  # классический цикл молчит, пока Live активен
         self.live = LiveSession(
@@ -134,6 +132,7 @@ class SharpApp(App):
             on_sharp_text=lambda t: self.call_from_thread(self._log_live_reply, t),
             on_status=lambda t: self.call_from_thread(self._live_status, t),
             capture_audio=False,
+            buffered_playback=buffered_playback,
         )
         self.set_status("CONNECTING")
         self.set_meta()
@@ -145,9 +144,10 @@ class SharpApp(App):
             self.mic_on = True
             self._ensure_mic_worker()
             self.set_status(f"SAY {WAKE_WORD.upper()}")
-        elif text.startswith("Live лагает"):
-            self._fallback_to_classic("Сеть не тянет Live — перешёл в классический режим. "
-                                      "/live — вернуться, когда интернет наладится.")
+        elif text.startswith(("Слабая сеть: загружаю", "Сеть просела:")):
+            self.set_status("BUFFERING AUDIO")
+        elif text.startswith("Голосовой ответ загружен"):
+            self.set_status("SPEAKING")
         elif text.startswith(("Обрыв Live", "Live-сессия завершилась")):
             self._fallback_to_classic("Live отключён, включён классический голосовой режим.")
 

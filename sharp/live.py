@@ -30,8 +30,8 @@ OUT_RATE = 24000
 IN_BLOCK = 1600          # 100мс кадр микрофона
 OUT_BLOCK = 1024
 
-# Для разговорного Live даже четверть секунды на один TLS handshake уже слишком
-# много.  250 мс теперь однозначно отправляют Sharp в классический режим.
+# Для разговорного стриминга даже четверть секунды на TLS handshake уже много.
+# При 200+ мс Live остаётся активным, но ответ сначала загружается целиком.
 NET_PROBE_LIMIT_MS = 200.0
 # Сколько «спотыканий» (пустая очередь ≥0.3с посреди ответа) терпим в одном ответе.
 STALL_LIMIT = 3
@@ -75,15 +75,16 @@ class LiveSession:
         on_status: Callable[[str], None],
         *,
         capture_audio: bool = True,
+        buffered_playback: bool = False,
     ) -> None:
         self.on_user_text = on_user_text
         self.on_sharp_text = on_sharp_text
         self.on_status = on_status
         self.capture_audio = capture_audio
+        self.buffered_playback = buffered_playback
 
         self.mic_on = True
         self._running = False
-        self.degraded = False   # True = убились из-за лагов сети (TUI уйдёт в классику)
         # Пользовательское состояние микрофона (mic_on) не трогаем во время
         # ответа. Отдельный флаг временно блокирует захват, пока играет голос
         # Sharp, а затем автоматически возвращает прежнее состояние.
@@ -267,6 +268,8 @@ class LiveSession:
     async def _receiver(self) -> None:
         """Читаем ответы: аудио → на воспроизведение, транскрипции → в ленту."""
         while self._running and self._session:
+            buffered_audio: list[bytes] = []
+            buffering_announced = False
             try:
                 turn = self._session.receive()
                 async for r in turn:
@@ -275,12 +278,13 @@ class LiveSession:
                     if r.tool_call:
                         await self._handle_tool_call(r.tool_call)
                     if r.data:
-                        self._begin_speaking()
-                        try:
-                            self._play_q.put_nowait(r.data)
-                        except queue.Full:
-                            self._drain_play_q()
-                            self._play_q.put_nowait(r.data)
+                        if self.buffered_playback:
+                            buffered_audio.append(r.data)
+                            if not buffering_announced:
+                                self.on_status("Слабая сеть: загружаю голосовой ответ целиком…")
+                                buffering_announced = True
+                        else:
+                            self._queue_audio(r.data)
                     sc = r.server_content
                     if not sc:
                         continue
@@ -290,8 +294,13 @@ class LiveSession:
                         self._out_buf += sc.output_transcription.text
                     if sc.interrupted:
                         self._drain_play_q()          # barge-in: сброс недоигранного
+                        buffered_audio.clear()
                         self._response_complete.set()
                     if sc.turn_complete:
+                        if buffered_audio:
+                            self._queue_audio(b"".join(buffered_audio))
+                            buffered_audio.clear()
+                            self.on_status("Голосовой ответ загружен — воспроизвожу.")
                         self._response_complete.set()
                         self._flush_transcripts()
             except Exception as e:  # noqa: BLE001
@@ -300,6 +309,15 @@ class LiveSession:
                 if self._stop_async:
                     self._stop_async.set()
                 break
+
+    def _queue_audio(self, chunk: bytes) -> None:
+        """Queue PCM for playback, dropping stale audio only as a last resort."""
+        self._begin_speaking()
+        try:
+            self._play_q.put_nowait(chunk)
+        except queue.Full:
+            self._drain_play_q()
+            self._play_q.put_nowait(chunk)
 
     async def _handle_tool_call(self, tool_call) -> None:
         """Gemini попросил вызвать инструмент(ы): выполняем и шлём результаты назад."""
@@ -363,16 +381,15 @@ class LiveSession:
                 if self._speaking.is_set() and self._response_complete.is_set():
                     self._end_speaking()
                     stalls = 0
-                elif self._speaking.is_set():
+                elif self._speaking.is_set() and not self.buffered_playback:
                     # ответ ещё идёт, а играть нечего — аудио застряло в сети
                     stalls += 1
                     if stalls >= STALL_LIMIT:
-                        self.degraded = True
-                        self.on_status("Live лагает: сеть не успевает за голосом.")
-                        self._running = False
-                        if self._loop and self._stop_async:
-                            self._loop.call_soon_threadsafe(self._stop_async.set)
-                        break
+                        # Не рвём сессию. Остаток этого ответа и все следующие
+                        # receiver соберёт целиком перед воспроизведением.
+                        self.buffered_playback = True
+                        self.on_status("Сеть просела: включаю загрузку ответа целиком.")
+                        stalls = 0
                 if audio.is_playing():
                     audio._playing.clear()
                     audio._push_levels(np.zeros(audio.NUM_BANDS, dtype=np.float32))
@@ -382,12 +399,13 @@ class LiveSession:
             stalls = 0
             samples = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
             audio._playing.set()
-            # визуализатор: раскладываем блоки на полосы, как в audio.play_pcm_blocking
-            for i in range(0, samples.size, OUT_BLOCK):
-                block = samples[i : i + OUT_BLOCK]
-                audio._push_levels(audio._bands_from_block(block))
             try:
-                stream.write(samples.reshape(-1, 1))
+                # Пишем по блокам: большой буфер воспроизводится плавно, а
+                # визуализатор остаётся синхронным со звуком.
+                for i in range(0, samples.size, OUT_BLOCK):
+                    block = samples[i : i + OUT_BLOCK]
+                    audio._push_levels(audio._bands_from_block(block))
+                    stream.write(block.reshape(-1, 1))
             except Exception:  # noqa: BLE001
                 break
 
