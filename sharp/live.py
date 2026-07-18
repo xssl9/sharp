@@ -1,0 +1,342 @@
+"""Реалтайм голос↔голос через Gemini Live API — один websocket вместо STT→chat→TTS.
+
+Убирает задержку старой цепочки (Google STT → gemini.chat → gemini.synth): здесь
+микрофон стримится прямо в модель, а её голос приходит потоком обратно. Серверный
+VAD сам определяет конец фразы, поэтому «сказал → услышал» почти мгновенно.
+
+LiveSession крутит собственный asyncio-loop в фоновом потоке (Textual занимает свой),
+и общается с TUI через колбэки on_user_text / on_sharp_text / on_status.
+"""
+from __future__ import annotations
+
+import asyncio
+import queue
+import threading
+from typing import Callable
+
+import numpy as np
+from google import genai
+from google.genai import types
+
+from . import audio, memory, tools
+from .config import CFG
+
+# Модель нативного аудио-диалога (проверено: коннектится и стримит голос по ключу).
+LIVE_MODEL = "gemini-2.5-flash-native-audio-latest"
+
+# Форматы PCM: вход в модель — 16кГц, выход из модели — 24кГц, оба mono s16le.
+IN_RATE = 16000
+OUT_RATE = 24000
+IN_BLOCK = 1600          # 100мс кадр микрофона
+OUT_BLOCK = 1024
+
+
+class LiveSession:
+    """Живая голосовая сессия. start()/stop()/toggle_mic()/send_text() — потокобезопасны."""
+
+    def __init__(
+        self,
+        on_user_text: Callable[[str], None],
+        on_sharp_text: Callable[[str], None],
+        on_status: Callable[[str], None],
+    ) -> None:
+        self.on_user_text = on_user_text
+        self.on_sharp_text = on_sharp_text
+        self.on_status = on_status
+
+        self.mic_on = True
+        self._running = False
+        # Пользовательское состояние микрофона (mic_on) не трогаем во время
+        # ответа. Отдельный флаг временно блокирует захват, пока играет голос
+        # Sharp, а затем автоматически возвращает прежнее состояние.
+        self._speaking = threading.Event()
+        self._response_complete = threading.Event()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._stop_async: asyncio.Event | None = None
+        self._session = None
+        self._thread: threading.Thread | None = None
+
+        # очереди PCM: микрофон → модель, модель → динамики
+        self._mic_q: "queue.Queue[bytes | None]" = queue.Queue(maxsize=32)
+        self._play_q: "queue.Queue[bytes | None]" = queue.Queue(maxsize=96)
+        # накопители транскрипций (флашим по границам реплик)
+        self._in_buf = ""
+        self._out_buf = ""
+
+    # --- управление из TUI (главный поток) ---
+    def start(self) -> None:
+        if self._running:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._running = False
+        self._put_stop_marker(self._mic_q)
+        self._put_stop_marker(self._play_q)
+        if self._loop and self._stop_async:
+            self._loop.call_soon_threadsafe(self._stop_async.set)
+        if self._thread and self._thread is not threading.current_thread():
+            self._thread.join(timeout=2.0)
+
+    @staticmethod
+    def _put_stop_marker(target: queue.Queue) -> None:
+        try:
+            target.put_nowait(None)
+        except queue.Full:
+            try:
+                target.get_nowait()
+                target.put_nowait(None)
+            except queue.Empty:
+                pass
+
+    def toggle_mic(self) -> bool:
+        self.mic_on = not self.mic_on
+        return self.mic_on
+
+    def _can_capture_mic(self) -> bool:
+        return self._running and self.mic_on and not self._speaking.is_set()
+
+    def _begin_speaking(self) -> None:
+        """Временно заглушить микрофон и выбросить ещё не отправленное эхо."""
+        if not self._speaking.is_set():
+            self._response_complete.clear()
+            self._speaking.set()
+            self._drain_mic_q()
+
+    def _end_speaking(self) -> None:
+        """Вернуть микрофон в выбранное пользователем состояние."""
+        self._speaking.clear()
+        self._response_complete.clear()
+
+    def send_text(self, text: str) -> bool:
+        """Отправить набранный текст в ту же live-сессию (потокобезопасно)."""
+        if not (self._running and self._loop and self._session):
+            return False
+
+        async def _send():
+            await self._session.send_client_content(
+                turns={"role": "user", "parts": [{"text": text}]},
+                turn_complete=True,
+            )
+
+        try:
+            asyncio.run_coroutine_threadsafe(_send(), self._loop)
+        except RuntimeError:
+            return False
+        return True
+
+    # --- фоновый поток с собственным event-loop ---
+    def _run(self) -> None:
+        try:
+            asyncio.run(self._main())
+        except Exception as e:  # noqa: BLE001
+            self.on_status(f"Live-сессия завершилась: {str(e)[:100]}")
+        finally:
+            self._running = False
+            self._session = None
+            self._loop = None
+            self._stop_async = None
+
+    async def _main(self) -> None:
+        self._loop = asyncio.get_running_loop()
+        self._stop_async = asyncio.Event()
+        client = genai.Client(api_key=CFG.require_key())
+        cfg = types.LiveConnectConfig(
+            response_modalities=["AUDIO"],
+            system_instruction=tools.LIVE_SYSTEM_PROMPT + memory.as_prompt(),
+            input_audio_transcription=types.AudioTranscriptionConfig(),
+            output_audio_transcription=types.AudioTranscriptionConfig(),
+            tools=[tools.gemini_tool()],
+            speech_config=types.SpeechConfig(
+                voice_config=types.VoiceConfig(
+                    prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=CFG.voice)
+                )
+            ),
+        )
+        async with client.aio.live.connect(model=CFG.live_model, config=cfg) as session:
+            self._session = session
+            self.on_status(f"Live-режим активен ({CFG.voice}). Говорите, сэр.")
+            # воспроизведение — в отдельном потоке (blocking sounddevice)
+            play_thread = threading.Thread(target=self._player, daemon=True)
+            play_thread.start()
+            # микрофон — в отдельном потоке, кадры в очередь
+            mic_thread = threading.Thread(target=self._mic_reader, daemon=True)
+            mic_thread.start()
+            sender = asyncio.create_task(self._sender())
+            receiver = asyncio.create_task(self._receiver())
+            try:
+                await self._stop_async.wait()
+            finally:
+                sender.cancel()
+                receiver.cancel()
+                await asyncio.gather(sender, receiver, return_exceptions=True)
+                self._session = None
+                self._put_stop_marker(self._play_q)
+
+    # --- микрофон: sounddevice-поток пишет PCM в очередь ---
+    def _mic_reader(self) -> None:
+        import sounddevice as sd
+
+        def cb(indata, frames, time, status):  # noqa: ANN001, ARG001
+            if not self._can_capture_mic():
+                return
+            pcm = (np.clip(indata[:, 0], -1, 1) * 32767).astype(np.int16).tobytes()
+            try:
+                self._mic_q.put_nowait(pcm)
+            except queue.Full:
+                pass
+
+        try:
+            with sd.InputStream(samplerate=IN_RATE, channels=1, dtype="float32",
+                                blocksize=IN_BLOCK, callback=cb):
+                while self._running:
+                    sd.sleep(100)
+        except Exception as e:  # noqa: BLE001
+            self.on_status(f"Микрофон недоступен: {str(e)[:80]}")
+
+    async def _sender(self) -> None:
+        """Достаём кадры микрофона из очереди и шлём в модель."""
+        while self._running:
+            try:
+                pcm = await asyncio.to_thread(self._mic_q.get, True, 0.5)
+            except queue.Empty:
+                continue
+            if pcm is None:
+                break
+            # Фрейм мог попасть в очередь непосредственно перед началом ответа.
+            if self._speaking.is_set():
+                continue
+            if not self._session:
+                continue
+            try:
+                await self._session.send_realtime_input(
+                    audio=types.Blob(data=pcm, mime_type=f"audio/pcm;rate={IN_RATE}")
+                )
+            except Exception:  # noqa: BLE001
+                break
+        if self._stop_async:
+            self._stop_async.set()
+
+    async def _receiver(self) -> None:
+        """Читаем ответы: аудио → на воспроизведение, транскрипции → в ленту."""
+        while self._running and self._session:
+            try:
+                turn = self._session.receive()
+                async for r in turn:
+                    if not self._running:
+                        break
+                    if r.tool_call:
+                        await self._handle_tool_call(r.tool_call)
+                    if r.data:
+                        self._begin_speaking()
+                        try:
+                            self._play_q.put_nowait(r.data)
+                        except queue.Full:
+                            self._drain_play_q()
+                            self._play_q.put_nowait(r.data)
+                    sc = r.server_content
+                    if not sc:
+                        continue
+                    if sc.input_transcription and sc.input_transcription.text:
+                        self._in_buf += sc.input_transcription.text
+                    if sc.output_transcription and sc.output_transcription.text:
+                        self._out_buf += sc.output_transcription.text
+                    if sc.interrupted:
+                        self._drain_play_q()          # barge-in: сброс недоигранного
+                        self._response_complete.set()
+                    if sc.turn_complete:
+                        self._response_complete.set()
+                        self._flush_transcripts()
+            except Exception as e:  # noqa: BLE001
+                if self._running:
+                    self.on_status(f"Обрыв Live: {str(e)[:80]}")
+                if self._stop_async:
+                    self._stop_async.set()
+                break
+
+    async def _handle_tool_call(self, tool_call) -> None:
+        """Gemini попросил вызвать инструмент(ы): выполняем и шлём результаты назад."""
+        responses = []
+        for fc in tool_call.function_calls:
+            args = dict(fc.args) if fc.args else {}
+            shown = ", ".join(f"{k}={v}" for k, v in args.items())
+            self.on_status(f"⚙ {fc.name}({shown})")
+            result = await asyncio.to_thread(tools.execute, fc.name, args)
+            responses.append(
+                types.FunctionResponse(id=fc.id, name=fc.name, response=result)
+            )
+        if responses and self._session:
+            try:
+                await self._session.send_tool_response(function_responses=responses)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _flush_transcripts(self) -> None:
+        if self._in_buf.strip():
+            self.on_user_text(self._in_buf.strip())
+        if self._out_buf.strip():
+            self.on_sharp_text(self._out_buf.strip())
+        self._in_buf = ""
+        self._out_buf = ""
+
+    def _drain_play_q(self) -> None:
+        try:
+            while True:
+                self._play_q.get_nowait()
+        except queue.Empty:
+            pass
+
+    def _drain_mic_q(self) -> None:
+        try:
+            while True:
+                self._mic_q.get_nowait()
+        except queue.Empty:
+            pass
+
+    # --- воспроизведение ответа + кормёжка визуализатора ---
+    def _player(self) -> None:
+        import sounddevice as sd
+
+        try:
+            stream = sd.OutputStream(samplerate=OUT_RATE, channels=1, dtype="float32",
+                                     blocksize=OUT_BLOCK)
+            stream.start()
+        except Exception as e:  # noqa: BLE001
+            self.on_status(f"Вывод звука недоступен: {str(e)[:80]}")
+            return
+
+        while self._running:
+            try:
+                chunk = self._play_q.get(timeout=0.3)
+            except queue.Empty:
+                # turn_complete приходит после последнего аудиофрагмента, но
+                # ждём ещё и фактического опустошения очереди воспроизведения.
+                # Таймаут даёт короткий запас против акустического хвоста.
+                if self._speaking.is_set() and self._response_complete.is_set():
+                    self._end_speaking()
+                if audio.is_playing():
+                    audio._playing.clear()
+                    audio._push_levels(np.zeros(audio.NUM_BANDS, dtype=np.float32))
+                continue
+            if chunk is None:
+                break
+            samples = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
+            audio._playing.set()
+            # визуализатор: раскладываем блоки на полосы, как в audio.play_pcm_blocking
+            for i in range(0, samples.size, OUT_BLOCK):
+                block = samples[i : i + OUT_BLOCK]
+                audio._push_levels(audio._bands_from_block(block))
+            try:
+                stream.write(samples.reshape(-1, 1))
+            except Exception:  # noqa: BLE001
+                break
+
+        audio._playing.clear()
+        self._end_speaking()
+        audio._push_levels(np.zeros(audio.NUM_BANDS, dtype=np.float32))
+        try:
+            stream.stop(); stream.close()
+        except Exception:  # noqa: BLE001
+            pass

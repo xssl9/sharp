@@ -1,0 +1,71 @@
+Screen {
+    background: #000000;
+    color: #ffffff;
+    layers: base overlay;
+}
+
+#body {
+    layer: base;
+    width: 100%;
+    height: 100%;
+    background: #000000;
+}
+
+#viz {
+    width: 100%;
+    height: 100%;
+    background: #000000;
+}
+
+/* Последние реплики лежат поверх cava и не занимают отдельную панель. */
+#log {
+    layer: overlay;
+    dock: top;
+    width: 100%;
+    height: auto;
+    max-height: 10;
+    padding: 0 1;
+    background: #000000 72%;
+    color: #d7d7d7;
+    scrollbar-size: 0 0;
+}
+
+/* Единственная видимая панель — одна строка внизу экрана. */
+#promptbar {
+    layer: overlay;
+    dock: bottom;
+    width: 100%;
+    height: 1;
+    background: #000000;
+    color: #ffffff;
+}
+
+#prompt-mark {
+    width: 2;
+    height: 1;
+    color: #ffffff;
+    content-align: center middle;
+    text-style: bold;
+}
+
+#input {
+    width: 1fr;
+    height: 1;
+    min-height: 1;
+    border: none;
+    padding: 0;
+    background: #000000;
+    color: #ffffff;
+}
+
+#input:focus {
+    border: none;
+}
+
+#status {
+    width: 14;
+    height: 1;
+    padding: 0 1 0 0;
+    color: #808080;
+    text-align: right;
+}

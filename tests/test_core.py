@@ -1,0 +1,228 @@
+from __future__ import annotations
+
+import asyncio
+import tempfile
+import unittest
+import json
+from pathlib import Path
+from unittest.mock import patch
+
+from sharp import config
+from sharp import commands
+from sharp.agent_sessions import AgentSession, list_codex_sessions
+from sharp.assistant import Assistant
+from sharp.commands import run_shell
+from sharp.live import LiveSession
+from sharp.storage import atomic_write_json
+
+
+class StorageTests(unittest.TestCase):
+    def test_atomic_json_replaces_complete_document(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "state.json"
+            atomic_write_json(path, {"ready": True})
+            self.assertEqual(path.read_text("utf-8"), '{\n  "ready": true\n}\n')
+
+
+class ConfigTests(unittest.TestCase):
+    def test_save_migrates_legacy_key_out_of_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = root / "config.toml"
+            credentials = root / "credentials.toml"
+            settings.write_text('api_key = "legacy-secret"\nvoice = "Kore"\n', "utf-8")
+
+            with (
+                patch.object(config, "CONFIG_PATH", settings),
+                patch.object(config, "CREDENTIALS_PATH", credentials),
+            ):
+                config.save_config()
+
+            self.assertNotIn("legacy-secret", settings.read_text("utf-8"))
+            self.assertIn("legacy-secret", credentials.read_text("utf-8"))
+
+
+class AssistantTests(unittest.TestCase):
+    def test_forget_everything_clears_memory_not_history_only(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            history = Path(directory) / "history.json"
+            with (
+                patch("sharp.assistant.HISTORY_PATH", history),
+                patch("sharp.assistant.memory.clear", return_value=3) as clear_memory,
+            ):
+                reply = Assistant().process("забудь всё")
+
+            clear_memory.assert_called_once_with()
+            self.assertEqual(reply, "Стёр 3 фактов из памяти, сэр.")
+
+    def test_shell_commands_are_disabled_by_default(self) -> None:
+        with patch.object(config.CFG, "allow_shell_commands", False):
+            result = run_shell("echo should-not-run")
+        self.assertIn("отключены", result)
+
+    def test_delegation_asks_for_session_and_uses_selected_one(self) -> None:
+        sessions = [
+            AgentSession("codex", "first-id", "Первая задача", 2.0),
+            AgentSession("codex", "second-id", "Вторая задача", 1.0, "/tmp"),
+        ]
+        assistant = Assistant()
+        with patch("sharp.assistant.commands.agent_sessions", return_value=sessions):
+            question = assistant.begin_delegation("codex", "Исправь тесты")
+        self.assertIn("1. Первая задача", question)
+        self.assertIn("0. Новая сессия", question)
+
+        with patch("sharp.assistant.commands.delegate_to_session", return_value="ok") as delegate:
+            reply = assistant._finish_delegation("2")
+        delegate.assert_called_once_with("codex", "Исправь тесты", "second-id", "/tmp")
+        self.assertIn("Вторая задача", reply)
+
+    def test_spoken_ordinal_selects_session(self) -> None:
+        assistant = Assistant()
+        assistant.pending_delegation = {
+            "agent": "codex",
+            "prompt": "Задача",
+            "sessions": [AgentSession("codex", "one", "Один", 1.0)],
+        }
+        with patch("sharp.assistant.commands.delegate_to_session", return_value="ok") as delegate:
+            assistant._finish_delegation("выбираю первую сессию")
+        delegate.assert_called_once_with("codex", "Задача", "one", "")
+
+    def test_yandex_voice_command_targets_yandex_handler(self) -> None:
+        assistant = Assistant()
+        with patch("sharp.assistant.commands.yandex_music", return_value="ok") as yandex:
+            reply = assistant._quick_yandex("следующий трек в Яндекс Музыке", "следующий трек в яндекс музыке")
+        yandex.assert_called_once_with("next")
+        self.assertEqual(reply, "Следующий трек, сэр.")
+
+    def test_yandex_context_keeps_followup_commands_on_yandex(self) -> None:
+        assistant = Assistant()
+        with patch("sharp.assistant.commands.yandex_music", return_value="ok") as yandex:
+            assistant._quick_yandex("включи Мою волну", "включи мою волну")
+            assistant._quick_yandex("а теперь сделай тише", "а теперь сделай тише")
+        self.assertEqual(yandex.call_args_list[-1].args, ("volumedown",))
+
+    def test_voice_session_list_can_ask_agent_as_followup(self) -> None:
+        assistant = Assistant()
+        question = assistant._voice_session_control("покажи список сессий")
+        self.assertEqual(question, "Сессии Codex или Claude Code, сэр?")
+        self.assertTrue(assistant.pending_session_list)
+
+        with patch("sharp.assistant.commands.agent_sessions", return_value=[
+            AgentSession("codex", "id", "Рабочая сессия", 1.0)
+        ]):
+            answer = assistant.process("Codex")
+        self.assertIn("1. Рабочая сессия", answer)
+        self.assertFalse(assistant.pending_session_list)
+
+    def test_voice_delegation_phrase_starts_selection(self) -> None:
+        assistant = Assistant()
+        with patch("sharp.assistant.commands.agent_sessions", return_value=[
+            AgentSession("codex", "id", "Sharp", 1.0)
+        ]):
+            answer = assistant._local_control(
+                "передай Кодексу исправить визуализатор",
+                "передай кодексу исправить визуализатор",
+            )
+        self.assertIn("В какую сессию Codex", answer)
+        self.assertIsNotNone(assistant.pending_delegation)
+
+
+class AgentSessionTests(unittest.TestCase):
+    def test_codex_index_is_sorted_by_update_time(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "session_index.jsonl"
+            rows = [
+                {"id": "old", "thread_name": "Старая", "updated_at": "2026-01-01T00:00:00Z"},
+                {"id": "new", "thread_name": "Новая", "updated_at": "2026-02-01T00:00:00Z"},
+            ]
+            path.write_text("\n".join(json.dumps(row) for row in rows), "utf-8")
+            sessions = list_codex_sessions(path)
+        self.assertEqual([session.session_id for session in sessions], ["new", "old"])
+
+
+class YandexMusicTests(unittest.TestCase):
+    def test_next_targets_yandex_player(self) -> None:
+        with (
+            patch("sharp.commands._yandex_player", return_value="firefox.instance"),
+            patch("sharp.commands._run", return_value="ok") as run,
+        ):
+            result = commands.yandex_music("next")
+        self.assertEqual(result, "ok")
+        run.assert_called_once_with(
+            ["playerctl", "--player=firefox.instance", "next"]
+        )
+
+    def test_artist_opens_yandex_search(self) -> None:
+        with patch("sharp.commands.open_url", return_value="ok") as open_url:
+            result = commands.yandex_music("artist", "Кино")
+        self.assertEqual(result, "ok")
+        open_url.assert_called_once_with("https://music.yandex.ru/search?text=%D0%9A%D0%B8%D0%BD%D0%BE")
+
+
+class LiveSessionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_mic_is_temporarily_suspended_while_sharp_speaks(self) -> None:
+        live = LiveSession(lambda _: None, lambda _: None, lambda _: None)
+        live._running = True
+        live.mic_on = True
+        live._mic_q.put_nowait(b"queued-before-reply")
+
+        live._begin_speaking()
+
+        self.assertFalse(live._can_capture_mic())
+        self.assertTrue(live.mic_on)  # пользовательское состояние не потеряно
+        self.assertTrue(live._mic_q.empty())
+
+        live._response_complete.set()
+        live._end_speaking()
+
+        self.assertTrue(live._can_capture_mic())
+
+    async def test_auto_unmute_does_not_override_manual_mute(self) -> None:
+        live = LiveSession(lambda _: None, lambda _: None, lambda _: None)
+        live._running = True
+        live.mic_on = False
+
+        live._begin_speaking()
+        live._end_speaking()
+
+        self.assertFalse(live._can_capture_mic())
+        self.assertFalse(live.mic_on)
+
+    async def test_receiver_keeps_session_after_normal_turn_boundary(self) -> None:
+        class EmptyResponse:
+            tool_call = None
+            data = None
+            server_content = None
+
+        class EmptyTurn:
+            def __init__(self, response_count: int) -> None:
+                self.response_count = response_count
+
+            async def __aiter__(self):
+                for _ in range(self.response_count):
+                    yield EmptyResponse()
+
+        class FakeSession:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def receive(self) -> EmptyTurn:
+                self.calls += 1
+                if self.calls == 1:
+                    return EmptyTurn(1)
+                raise RuntimeError("stop")
+
+        session = FakeSession()
+        live = LiveSession(lambda _: None, lambda _: None, lambda _: None)
+        live._running = True
+        live._session = session
+        live._stop_async = asyncio.Event()
+
+        await live._receiver()
+
+        self.assertEqual(session.calls, 2)
+        self.assertTrue(live._stop_async.is_set())
+
+
+if __name__ == "__main__":
+    unittest.main()
