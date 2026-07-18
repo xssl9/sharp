@@ -29,6 +29,8 @@ SYSTEM_PROMPT = """Ты — ИИ-ассистент «Шарп» (Sharp), гол
 - SEARCH:запрос — поискать в Google
 - TERM:команда — выполнить ЛЮБУЮ команду в терминале Linux (открыть программу с
   аргументами, например TERM:dolphin ~/Рабочий стол  или  TERM:libreoffice --writer)
+- INSTALL_REQUEST:пакет — подготовить установку и спросить отдельное подтверждение
+- INSTALL:пакет — только в следующей реплике после явного подтверждения открыть pacman
 - READFILE:путь — прочитать файл
 - LISTDIR:путь — показать содержимое папки
 - REMEMBER:факт — запомнить факт о пользователе навсегда
@@ -368,8 +370,14 @@ class Assistant:
         m = re.search(r"TERM:\s*([^\n]+)", answer)
         if m:
             result = commands.run_shell(m.group(1).strip())
-            if result != "ok":
-                execution_notes.append(f"Команда не выполнена: {result}.")
+            execution_notes.append(f"Вывод команды: {result[:1200]}")
+        # INSTALL_REQUEST / INSTALL — установка всегда состоит из двух голосовых ходов
+        m = re.search(r"INSTALL_REQUEST:\s*([^\s]+)", answer)
+        if m:
+            execution_notes.append(commands.prepare_package_install(m.group(1).strip()))
+        m = re.search(r"INSTALL:\s*([^\s]+)", answer)
+        if m:
+            execution_notes.append(commands.install_package(m.group(1).strip()))
         # REMEMBER — запомнить факт навсегда
         m = re.search(r"REMEMBER:\s*([^\n]+)", answer)
         if m:
@@ -402,7 +410,7 @@ class Assistant:
 
         # вычищаем все командные префиксы из текста, который увидит/озвучит пользователь
         clean = re.sub(
-            r"(MEDIA|YANDEX|OPEN|RUN|STEAM|SEARCH|TERM|READFILE|LISTDIR|REMEMBER|SETVOICE|SETSTYLE):\s*[^\n]*",
+            r"(MEDIA|YANDEX|OPEN|RUN|STEAM|SEARCH|TERM|INSTALL_REQUEST|INSTALL|READFILE|LISTDIR|REMEMBER|SETVOICE|SETSTYLE):\s*[^\n]*",
             "", answer,
         )
         clean = re.sub(r"AGENT:\s*[^|\n]+\|[^\n]*", "", clean).strip()

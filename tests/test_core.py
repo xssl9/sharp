@@ -10,7 +10,13 @@ from unittest.mock import patch
 from sharp import commands, config
 from sharp.agent_sessions import AgentSession, list_codex_sessions
 from sharp.assistant import Assistant
-from sharp.commands import run_shell
+from sharp.commands import (
+    install_package,
+    open_app,
+    prepare_package_install,
+    run_shell,
+    run_terminal,
+)
 from sharp.live import LiveSession
 from sharp.storage import atomic_write_json
 from sharp.stt import _transcripts_from_google
@@ -60,6 +66,37 @@ class AssistantTests(unittest.TestCase):
         with patch.object(config.CFG, "allow_shell_commands", False):
             result = run_shell("echo should-not-run")
         self.assertIn("отключены", result)
+
+    def test_terminal_output_is_returned_to_assistant(self) -> None:
+        with patch.object(config.CFG, "allow_shell_commands", True):
+            result = run_terminal("printf sharp-output")
+        self.assertIn("exit_code=0", result)
+        self.assertIn("sharp-output", result)
+
+    def test_open_app_does_not_require_shell_permission(self) -> None:
+        with (
+            patch.object(config.CFG, "allow_shell_commands", False),
+            patch("sharp.commands.shutil.which", return_value="/usr/bin/dolphin"),
+            patch("sharp.commands._run", return_value="ok") as run,
+        ):
+            result = open_app("проводник")
+        self.assertEqual(result, "ok")
+        run.assert_called_once_with(["dolphin"])
+
+    def test_install_package_validates_name_and_opens_pacman_terminal(self) -> None:
+        self.assertIn("некорректное", install_package("firefox; reboot"))
+        self.assertIn("не подтверждена", install_package("firefox"))
+        self.assertIn("подтверждение", prepare_package_install("firefox"))
+        with (
+            patch("sharp.commands.shutil.which", return_value="/usr/bin/pacman"),
+            patch("sharp.commands._term", return_value=["kitty", "--hold", "-e"]),
+            patch("sharp.commands._run_in_terminal", return_value="ok") as run,
+        ):
+            result = install_package("firefox")
+        self.assertIn("firefox", result)
+        run.assert_called_once_with([
+            "kitty", "--hold", "-e", "sudo", "pacman", "-S", "--needed", "firefox"
+        ])
 
     def test_delegation_asks_for_session_and_uses_selected_one(self) -> None:
         sessions = [

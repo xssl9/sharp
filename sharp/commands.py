@@ -5,7 +5,12 @@ Steam-игры → xdg-open steam://rungameid/ID. Работа с файлами
 """
 from __future__ import annotations
 
+import re
+import shlex
+import shutil
 import subprocess
+import threading
+import time
 from pathlib import Path
 
 from .agent_sessions import AgentSession, list_sessions
@@ -44,12 +49,15 @@ SITES: dict[str, str] = {
 
 # Псевдонимы приложений -> исполняемый файл в Linux
 APPS: dict[str, str] = {
-    "браузер": "xdg-open", "chrome": "google-chrome-stable", "хром": "google-chrome-stable",
+    "браузер": "firefox", "chrome": "google-chrome-stable", "хром": "google-chrome-stable",
+    "google chrome": "google-chrome-stable", "гугл хром": "google-chrome-stable",
     "firefox": "firefox", "файрфокс": "firefox",
     "терминал": "kitty", "terminal": "kitty",
-    "код": "code", "vscode": "code", "vs code": "code",
-    "калькулятор": "gnome-calculator", "calculator": "gnome-calculator",
-    "проводник": "nautilus", "файлы": "nautilus",
+    "код": "code", "vscode": "code", "vs code": "code", "visual studio code": "code",
+    "калькулятор": "kcalc", "calculator": "kcalc",
+    "проводник": "dolphin", "файлы": "dolphin", "файловый менеджер": "dolphin",
+    "телеграм": "telegram-desktop", "telegram": "telegram-desktop",
+    "дискорд": "discord", "discord": "discord",
 }
 
 
@@ -159,9 +167,19 @@ def open_url(url: str) -> str:
     return _run(["xdg-open", url])
 
 
-def open_app(name: str) -> str:
-    exe = APPS.get(name.lower(), name)
-    return _run([exe])
+def open_app(name: str, arguments: str = "") -> str:
+    """Open a GUI application without granting arbitrary shell access."""
+    key = name.lower().strip()
+    exe = APPS.get(key, key)
+    if not exe:
+        return "не указана программа"
+    if not shutil.which(exe):
+        return f"программа не установлена: {exe}"
+    try:
+        args = shlex.split(arguments) if arguments.strip() else []
+    except ValueError as error:
+        return f"не разобрал аргументы: {error}"
+    return _run([exe, *args])
 
 
 def open_steam(app_id: int | str) -> str:
@@ -216,33 +234,97 @@ _BLOCKED = (
     "> /dev", "chmod -r 000", "chown -r", "mv / ", "> /etc",
 )
 
+_MAX_TERMINAL_OUTPUT = 8_000
 
-def run_shell(command: str) -> str:
-    """Выполнить команду в системе (открыть программу/файл). Возвращает 'ok' или ошибку.
 
-    Пример: run_shell("dolphin ~/Рабочий стол") → откроет Dolphin в этой папке.
-    """
-    import os
-    import shlex
+def _command_is_blocked(command: str) -> bool:
+    low = " ".join(command.lower().split())
+    if any(blocked in low for blocked in _BLOCKED):
+        return True
+    # Установку делаем только отдельной функцией с проверенным именем пакета.
+    return bool(re.search(r"(?:^|[;&|]\s*)(?:sudo\s+)?pacman\s+-\s*s\b", low))
 
+
+def run_terminal(command: str, timeout: int = 30) -> str:
+    """Run a terminal command and return exit code plus bounded stdout/stderr."""
     from .config import CFG
 
     cmd = command.strip()
     if not cmd:
         return "пустая команда"
     if not CFG.allow_shell_commands:
-        return "произвольные shell-команды отключены в config.toml"
-    low = cmd.lower()
-    if any(b in low for b in _BLOCKED):
-        return f"команда заблокирована по безопасности: {cmd}"
+        return "терминальные команды отключены в config.toml"
+    if _command_is_blocked(cmd):
+        return "команда заблокирована; для установки используйте install_package"
     try:
-        # ~ и $ЕNV раскрываем сами, т.к. запускаем без shell
-        parts = [os.path.expanduser(os.path.expandvars(p)) for p in shlex.split(cmd)]
-    except ValueError as e:
-        return f"не разобрал команду: {e}"
-    if not parts:
-        return "пустая команда"
-    return _run(parts)
+        result = subprocess.run(
+            ["bash", "-lc", cmd],
+            capture_output=True,
+            text=True,
+            timeout=max(1, min(timeout, 120)),
+            check=False,
+        )
+    except subprocess.TimeoutExpired as error:
+        values = []
+        for value in (error.stdout, error.stderr):
+            if isinstance(value, bytes):
+                value = value.decode("utf-8", errors="replace")
+            if value:
+                values.append(value)
+        output = "\n".join(values)
+        return f"тайм-аут команды\n{output[-_MAX_TERMINAL_OUTPUT:]}".strip()
+    except Exception as error:  # noqa: BLE001
+        return f"ошибка запуска: {error}"
+
+    sections = [f"exit_code={result.returncode}"]
+    if result.stdout.strip():
+        sections.append("stdout:\n" + result.stdout.strip())
+    if result.stderr.strip():
+        sections.append("stderr:\n" + result.stderr.strip())
+    return "\n".join(sections)[-_MAX_TERMINAL_OUTPUT:]
+
+
+_PACKAGE_RE = re.compile(r"^[A-Za-z0-9@._+:-]+$")
+_install_lock = threading.Lock()
+_pending_install: tuple[str, float] | None = None
+
+
+def prepare_package_install(package: str) -> str:
+    """Remember a proposed package; a separate voice turn must confirm it."""
+    global _pending_install
+    name = package.strip()
+    if not _PACKAGE_RE.fullmatch(name):
+        return "некорректное имя пакета"
+    with _install_lock:
+        _pending_install = (name, time.monotonic() + 120.0)
+    return f"нужно подтверждение: спросите пользователя, установить пакет {name}?"
+
+
+def install_package(package: str) -> str:
+    """Open pacman installation in a visible terminal after strict name validation."""
+    global _pending_install
+    name = package.strip()
+    if not _PACKAGE_RE.fullmatch(name):
+        return "некорректное имя пакета"
+    with _install_lock:
+        pending = _pending_install
+        _pending_install = None
+    if not pending or pending[0] != name or pending[1] < time.monotonic():
+        return "установка не подтверждена; сначала вызовите prepare_package_install"
+    if not shutil.which("pacman"):
+        return "pacman не найден"
+    term = _term()
+    if not term:
+        return "не найден терминал (kitty/alacritty/konsole)"
+    result = _run_in_terminal(term + ["sudo", "pacman", "-S", "--needed", name])
+    if result != "ok":
+        return result
+    return f"открыт терминал установки {name}; pacman покажет вывод и запросит подтверждение"
+
+
+def run_shell(command: str) -> str:
+    """Backward-compatible alias for terminal command execution."""
+    return run_terminal(command)
 
 
 # --- Делегирование промптов внешним AI-агентам ---
@@ -251,7 +333,6 @@ def run_shell(command: str) -> str:
 
 def _term() -> list[str]:
     """Команда терминала-обёртки: kitty > alacritty > konsole."""
-    import shutil
     for term, prefix in (
         ("kitty", ["kitty", "--hold", "-e"]),
         ("alacritty", ["alacritty", "--hold", "-e"]),
