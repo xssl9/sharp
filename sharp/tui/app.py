@@ -41,6 +41,7 @@ class SharpApp(App):
         self.mic_on = True      # микрофон включён по умолчанию (классический режим)
         self._busy = threading.Event()
         self._shutdown_event = threading.Event()
+        self._live_waiting = threading.Event()
         self._mic_worker_started = False
         self._awake_until = 0.0
         self.live = None        # LiveSession, если активен реалтайм-режим
@@ -93,6 +94,7 @@ class SharpApp(App):
         self.log_line(f"{labels.get(role, '[#707070]SYS[/]   ')}{escape(text)}")
 
     def _log_live_reply(self, text: str) -> None:
+        self._live_waiting.clear()
         self._awake_until = time.monotonic() + DIALOG_WINDOW_SECONDS
         self.log_message("sharp", text)
 
@@ -123,6 +125,10 @@ class SharpApp(App):
         self._mic_worker_started = True
         self.run_worker(self._mic_loop, exclusive=False, thread=True)
 
+    def _mic_state(self, state: str) -> None:
+        """Show capture/recognition progress without waiting for online STT."""
+        self.call_from_thread(self.set_status, state)
+
     # --- реалтайм голос↔голос (Gemini Live API) ---
     def _start_live(self, buffered_playback: bool = False) -> None:
         from ..live import LiveSession
@@ -152,6 +158,7 @@ class SharpApp(App):
             self._fallback_to_classic("Live отключён, включён классический голосовой режим.")
 
     def _fallback_to_classic(self, message: str) -> None:
+        self._live_waiting.clear()
         if self.live:
             live = self.live
             self.live = None
@@ -338,7 +345,7 @@ class SharpApp(App):
             return
         while not self._shutdown_event.is_set():
             # не слушаем, пока Шарп думает/говорит или микрофон выключен
-            if not self.mic_on or self._busy.is_set():
+            if not self.mic_on or self._busy.is_set() or self._live_waiting.is_set():
                 time.sleep(0.2)
                 continue
             live = self.live
@@ -354,6 +361,7 @@ class SharpApp(App):
                 candidates = stt.listen_candidates(
                     cancel_event=cancel_event,
                     max_speech_seconds=max_seconds,
+                    on_state=self._mic_state,
                 )
             except Exception as e:  # noqa: BLE001
                 self.call_from_thread(self.log_line, f"[#f85149]Ошибка микрофона: {str(e)[:80]}")
@@ -394,6 +402,9 @@ class SharpApp(App):
                         "Live не отвечает — включён классический голосовой режим.",
                     )
                     self._respond(request, keep_awake=True)
+                else:
+                    self._live_waiting.set()
+                    self.call_from_thread(self.set_status, "THINKING")
             else:
                 self._respond(request, keep_awake=True)
 
@@ -413,6 +424,7 @@ class SharpApp(App):
 
     def on_unmount(self) -> None:
         self._shutdown_event.set()
+        self._live_waiting.clear()
         self.mic_on = False
         self._stop_live()
 

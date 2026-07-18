@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import threading
 from collections import deque
+from collections.abc import Callable
 
 import numpy as np
 
@@ -17,7 +18,7 @@ SAMPLE_RATE = 16000
 FRAME = 480              # 30 мс — формат, поддерживаемый WebRTC VAD
 MIN_START_RMS = 0.006
 MAX_SPEECH_SECONDS = 6
-MAX_WAKE_SECONDS = 1.6  # короткие циклы быстрее находят отдельное «Шарп»
+MAX_WAKE_SECONDS = 1.0  # отдельное «Шарп» помещается, а ожидание заметно короче
 SILENCE_TAIL = 0.48      # возврат к фону = конец фразы
 START_TIMEOUT = 30.0     # долго держим поток открытым, чтобы редко калиброваться
 PRE_ROLL_SECONDS = 0.50  # не режем тихое начало слова
@@ -29,6 +30,7 @@ _noise_rms_estimate: float | None = None
 def record_until_silence(
     cancel_event: threading.Event | None = None,
     max_speech_seconds: float = MAX_SPEECH_SECONDS,
+    on_speech_start: Callable[[], None] | None = None,
 ) -> bytes:
     """Записать фразу до паузы, вернуть PCM s16le 16кГц mono."""
     global _noise_rms_estimate
@@ -94,6 +96,8 @@ def record_until_silence(
                     quiet_frames = 0
                     collected.extend(pre_roll)
                     pre_roll.clear()
+                    if on_speech_start:
+                        on_speech_start()
                 else:
                     # Подстраиваемся под музыку/вентилятор, не догоняя резкий
                     # близкий голос пользователя.
@@ -136,6 +140,7 @@ def _transcripts_from_google(result: object) -> list[str]:
 def listen_candidates(
     cancel_event: threading.Event | None = None,
     max_speech_seconds: float = MAX_SPEECH_SECONDS,
+    on_state: Callable[[str], None] | None = None,
 ) -> list[str]:
     """Record one phrase and return recognition alternatives, best first."""
     import speech_recognition as sr
@@ -143,9 +148,12 @@ def listen_candidates(
     pcm = record_until_silence(
         cancel_event=cancel_event,
         max_speech_seconds=max_speech_seconds,
+        on_speech_start=(lambda: on_state("HEARING")) if on_state else None,
     )
     if not pcm:
         return []
+    if on_state:
+        on_state("RECOGNIZING")
     audio_data = sr.AudioData(pcm, SAMPLE_RATE, 2)
     recognizer = sr.Recognizer()
     try:

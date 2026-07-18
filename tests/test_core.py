@@ -19,7 +19,7 @@ from sharp.commands import (
 )
 from sharp.live import LiveSession
 from sharp.storage import atomic_write_json
-from sharp.stt import _transcripts_from_google
+from sharp.stt import _transcripts_from_google, listen_candidates
 from sharp.wake import extract_command
 
 
@@ -340,6 +340,30 @@ class SpeechRecognitionTests(unittest.TestCase):
             _transcripts_from_google(result),
             ["включи музыку", "шарп включи музыку"],
         )
+
+    def test_wake_capture_window_is_short(self) -> None:
+        from sharp.stt import MAX_WAKE_SECONDS
+
+        self.assertLessEqual(MAX_WAKE_SECONDS, 1.0)
+
+    def test_capture_states_are_reported_before_recognition_result(self) -> None:
+        states: list[str] = []
+
+        def fake_record(**kwargs) -> bytes:
+            kwargs["on_speech_start"]()
+            return b"\0" * 960
+
+        with (
+            patch("sharp.stt.record_until_silence", side_effect=fake_record),
+            patch(
+                "speech_recognition.Recognizer.recognize_google",
+                return_value={"alternative": [{"transcript": "шарп"}]},
+            ),
+        ):
+            result = listen_candidates(on_state=states.append)
+
+        self.assertEqual(states, ["HEARING", "RECOGNIZING"])
+        self.assertEqual(result, ["шарп"])
 
 
 class NetworkProbeTests(unittest.TestCase):
