@@ -30,6 +30,40 @@ OUT_RATE = 24000
 IN_BLOCK = 1600          # 100мс кадр микрофона
 OUT_BLOCK = 1024
 
+# Для разговорного Live даже четверть секунды на один TLS handshake уже слишком
+# много.  250 мс теперь однозначно отправляют Sharp в классический режим.
+NET_PROBE_LIMIT_MS = 200.0
+# Сколько «спотыканий» (пустая очередь ≥0.3с посреди ответа) терпим в одном ответе.
+STALL_LIMIT = 3
+
+
+def network_ok(limit_ms: float = NET_PROBE_LIMIT_MS) -> tuple[bool, float]:
+    """Быстрая проба: потянет ли сеть реалтайм-аудио. Возвращает (ок, время коннекта в мс).
+
+    Меряем TCP+TLS-хендшейк до эндпоинта Gemini (2 попытки, берём лучшую). На хорошем
+    интернете это до 200 мс, на слабом/мобильном — дольше. Ошибка сети = сразу не ок.
+    """
+    import socket
+    import ssl
+    import time as _t
+
+    host = "generativelanguage.googleapis.com"
+    ctx = ssl.create_default_context()
+    best: float | None = None
+    for _ in range(2):
+        t0 = _t.monotonic()
+        try:
+            with socket.create_connection((host, 443), timeout=2.0) as sock:
+                with ctx.wrap_socket(sock, server_hostname=host):
+                    pass
+        except OSError:
+            continue
+        ms = (_t.monotonic() - t0) * 1000.0
+        best = ms if best is None else min(best, ms)
+    if best is None:
+        return False, float("inf")
+    return best < limit_ms, best
+
 
 class LiveSession:
     """Живая голосовая сессия. start()/stop()/toggle_mic()/send_text() — потокобезопасны."""
@@ -39,13 +73,17 @@ class LiveSession:
         on_user_text: Callable[[str], None],
         on_sharp_text: Callable[[str], None],
         on_status: Callable[[str], None],
+        *,
+        capture_audio: bool = True,
     ) -> None:
         self.on_user_text = on_user_text
         self.on_sharp_text = on_sharp_text
         self.on_status = on_status
+        self.capture_audio = capture_audio
 
         self.mic_on = True
         self._running = False
+        self.degraded = False   # True = убились из-за лагов сети (TUI уйдёт в классику)
         # Пользовательское состояние микрофона (mic_on) не трогаем во время
         # ответа. Отдельный флаг временно блокирует захват, пока играет голос
         # Sharp, а затем автоматически возвращает прежнее состояние.
@@ -97,6 +135,11 @@ class LiveSession:
 
     def _can_capture_mic(self) -> bool:
         return self._running and self.mic_on and not self._speaking.is_set()
+
+    @property
+    def speaking_event(self) -> threading.Event:
+        """Event used by the wake listener to avoid recognizing speaker echo."""
+        return self._speaking
 
     def _begin_speaking(self) -> None:
         """Временно заглушить микрофон и выбросить ещё не отправленное эхо."""
@@ -161,9 +204,11 @@ class LiveSession:
             # воспроизведение — в отдельном потоке (blocking sounddevice)
             play_thread = threading.Thread(target=self._player, daemon=True)
             play_thread.start()
-            # микрофон — в отдельном потоке, кадры в очередь
-            mic_thread = threading.Thread(target=self._mic_reader, daemon=True)
-            mic_thread.start()
+            # В TUI вход сначала проходит локальный wake-word фильтр. Прямой
+            # аудиозахват оставлен для программного использования LiveSession.
+            if self.capture_audio:
+                mic_thread = threading.Thread(target=self._mic_reader, daemon=True)
+                mic_thread.start()
             sender = asyncio.create_task(self._sender())
             receiver = asyncio.create_task(self._receiver())
             try:
@@ -307,6 +352,7 @@ class LiveSession:
             self.on_status(f"Вывод звука недоступен: {str(e)[:80]}")
             return
 
+        stalls = 0  # «спотыкания»: очередь пуста посреди ответа = сеть не успевает
         while self._running:
             try:
                 chunk = self._play_q.get(timeout=0.3)
@@ -316,12 +362,24 @@ class LiveSession:
                 # Таймаут даёт короткий запас против акустического хвоста.
                 if self._speaking.is_set() and self._response_complete.is_set():
                     self._end_speaking()
+                    stalls = 0
+                elif self._speaking.is_set():
+                    # ответ ещё идёт, а играть нечего — аудио застряло в сети
+                    stalls += 1
+                    if stalls >= STALL_LIMIT:
+                        self.degraded = True
+                        self.on_status("Live лагает: сеть не успевает за голосом.")
+                        self._running = False
+                        if self._loop and self._stop_async:
+                            self._loop.call_soon_threadsafe(self._stop_async.set)
+                        break
                 if audio.is_playing():
                     audio._playing.clear()
                     audio._push_levels(np.zeros(audio.NUM_BANDS, dtype=np.float32))
                 continue
             if chunk is None:
                 break
+            stalls = 0
             samples = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
             audio._playing.set()
             # визуализатор: раскладываем блоки на полосы, как в audio.play_pcm_blocking

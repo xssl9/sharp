@@ -14,6 +14,7 @@ from sharp.assistant import Assistant
 from sharp.commands import run_shell
 from sharp.live import LiveSession
 from sharp.storage import atomic_write_json
+from sharp.wake import extract_command
 
 
 class StorageTests(unittest.TestCase):
@@ -222,6 +223,32 @@ class LiveSessionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(session.calls, 2)
         self.assertTrue(live._stop_async.is_set())
+
+
+class WakeWordTests(unittest.TestCase):
+    def test_ambient_speech_is_ignored(self) -> None:
+        self.assertIsNone(extract_command("включи музыку погромче"))
+
+    def test_command_after_russian_wake_word(self) -> None:
+        self.assertEqual(extract_command("Шарп, включи мою волну"), "включи мою волну")
+
+    def test_stt_english_spelling_and_wake_at_end(self) -> None:
+        self.assertEqual(extract_command("следующий трек, Sharp"), "следующий трек")
+
+    def test_name_alone_wakes_assistant(self) -> None:
+        self.assertEqual(extract_command("Шарп!"), "Слушай меня")
+
+
+class NetworkProbeTests(unittest.TestCase):
+    def test_250_ms_is_not_considered_fast(self) -> None:
+        from sharp.live import NET_PROBE_LIMIT_MS
+
+        self.assertLess(NET_PROBE_LIMIT_MS, 250.0)
+
+    def test_probe_limit_is_strict(self) -> None:
+        from sharp.live import NET_PROBE_LIMIT_MS
+
+        self.assertEqual(NET_PROBE_LIMIT_MS, 200.0)
 
 
 if __name__ == "__main__":

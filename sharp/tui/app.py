@@ -18,6 +18,7 @@ from textual.widgets import Input, RichLog, Static
 from .. import audio, commands, config, gemini, memory
 from ..assistant import Assistant
 from ..config import CFG, VOICES
+from ..wake import WAKE_WORD, extract_command
 from .visualizer import Visualizer
 
 
@@ -51,11 +52,28 @@ class SharpApp(App):
     def on_mount(self) -> None:
         self.query_one("#input", Input).focus()
         if CFG.live_mode:
-            self.mic_on = False
-            self._start_live()
+            self.set_status("PROBING NET")
+            self._ensure_mic_worker()
+            self.run_worker(self._probe_and_start, exclusive=False, thread=True)
         else:
             self._ensure_mic_worker()
-            self.set_status("LISTENING")
+            self.set_status(f"SAY {WAKE_WORD.upper()}")
+
+    def _probe_and_start(self) -> None:
+        """Проба сети: быстрая → Live, медленная → классический режим."""
+        from ..live import network_ok
+        ok, ms = network_ok()
+        shown = f"{ms:.0f}мс" if ms != float("inf") else "нет сети"
+        if ok:
+            self.call_from_thread(self.log_line, f"[#707070]SYS[/]   Сеть быстрая ({shown}) — Live-режим.")
+            self.call_from_thread(self._start_live)
+        else:
+            self.call_from_thread(self.log_line,
+                                  f"[#707070]SYS[/]   Сеть слабая ({shown}) — классический режим. "
+                                  "/live — попробовать Live вручную.")
+            self.mic_on = True
+            self.call_from_thread(self._ensure_mic_worker)
+            self.call_from_thread(self.set_status, f"SAY {WAKE_WORD.upper()}")
 
     def set_status(self, state: str) -> None:
         self.query_one("#status", Static).update(state)
@@ -80,10 +98,12 @@ class SharpApp(App):
     # --- реалтайм голос↔голос (Gemini Live API) ---
     def _start_live(self) -> None:
         from ..live import LiveSession
+        self.mic_on = False  # классический цикл молчит, пока Live активен
         self.live = LiveSession(
             on_user_text=lambda t: self.call_from_thread(self.log_message, "voice", t),
             on_sharp_text=lambda t: self.call_from_thread(self.log_message, "sharp", t),
             on_status=lambda t: self.call_from_thread(self._live_status, t),
+            capture_audio=False,
         )
         self.set_status("CONNECTING")
         self.set_meta()
@@ -92,13 +112,24 @@ class SharpApp(App):
     def _live_status(self, text: str) -> None:
         self.log_line(f"[#707070]SYS[/]   {escape(text)}")
         if text.startswith("Live-режим активен"):
-            self.set_status("LISTENING")
-        elif text.startswith(("Обрыв Live", "Live-сессия завершилась")):
-            self.live = None
             self.mic_on = True
             self._ensure_mic_worker()
-            self.log_line("[#707070]SYS[/]   Live отключён, включён классический голосовой режим.")
-            self.set_status("LISTENING")
+            self.set_status(f"SAY {WAKE_WORD.upper()}")
+        elif text.startswith("Live лагает"):
+            self._fallback_to_classic("Сеть не тянет Live — перешёл в классический режим. "
+                                      "/live — вернуться, когда интернет наладится.")
+        elif text.startswith(("Обрыв Live", "Live-сессия завершилась")):
+            self._fallback_to_classic("Live отключён, включён классический голосовой режим.")
+
+    def _fallback_to_classic(self, message: str) -> None:
+        if self.live:
+            live = self.live
+            self.live = None
+            self.run_worker(live.stop, exclusive=False, thread=True)
+        self.mic_on = True
+        self._ensure_mic_worker()
+        self.log_line(f"[#707070]SYS[/]   {escape(message)}")
+        self.set_status(f"SAY {WAKE_WORD.upper()}")
 
     def _stop_live(self) -> None:
         if self.live:
@@ -259,7 +290,7 @@ class SharpApp(App):
                     self.call_from_thread(self.log_line, f"[#f85149]Озвучка не удалась: {str(e)[:80]}")
         finally:
             self._busy.clear()
-            state = "LISTENING" if self.mic_on else "READY"
+            state = f"SAY {WAKE_WORD.upper()}" if self.mic_on else "READY"
             self.call_from_thread(self.set_status, state)
 
     # --- микрофон: постоянный фоновый цикл (включён по умолчанию) ---
@@ -273,30 +304,47 @@ class SharpApp(App):
         import time
         while not self._shutdown_event.is_set():
             # не слушаем, пока Шарп думает/говорит или микрофон выключен
-            if not self.mic_on or self._busy.is_set() or self.live:
+            if not self.mic_on or self._busy.is_set():
                 time.sleep(0.2)
+                continue
+            live = self.live
+            if live and live.speaking_event.is_set():
+                time.sleep(0.1)
                 continue
             try:
                 # Если ответ начался, прерываем уже открытый InputStream, чтобы
                 # он не успел записать и затем распознать голос самого Sharp.
-                text = stt.listen_once(cancel_event=self._busy)
+                cancel_event = live.speaking_event if live else self._busy
+                text = stt.listen_once(cancel_event=cancel_event)
             except Exception as e:  # noqa: BLE001
                 self.call_from_thread(self.log_line, f"[#f85149]Ошибка микрофона: {str(e)[:80]}")
                 time.sleep(1.0)
                 continue
             if not text or self._busy.is_set() or not self.mic_on:
                 continue
+            command = extract_command(text)
+            if command is None:
+                continue
             self.call_from_thread(self.log_message, "voice", text)
-            self._respond(text)
+            if self.live:
+                if not self.live.send_text(command):
+                    self.call_from_thread(
+                        self._fallback_to_classic,
+                        "Live не отвечает — включён классический голосовой режим.",
+                    )
+                    self._respond(command)
+            else:
+                self._respond(command)
 
     def action_listen(self) -> None:
         if self.live:
-            on = self.live.toggle_mic()
-            self.set_status("LISTENING" if on else "MIC PAUSED")
+            self.mic_on = not self.mic_on
+            on = self.mic_on
+            self.set_status(f"SAY {WAKE_WORD.upper()}" if on else "MIC PAUSED")
             self.log_line(f"[#d29922]Микрофон {'включён — говорите' if on else 'на паузе'}.")
             return
         self.mic_on = not self.mic_on
-        self.set_status("LISTENING" if self.mic_on else "MIC PAUSED")
+        self.set_status(f"SAY {WAKE_WORD.upper()}" if self.mic_on else "MIC PAUSED")
         self.log_line(f"[#d29922]Микрофон {'включён — говорите' if self.mic_on else 'выключен'}.")
 
     def action_clear(self) -> None:
