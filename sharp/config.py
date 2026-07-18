@@ -35,6 +35,7 @@ class Config:
     voice: str = "Charon"
     voice_style: str = "Скажи спокойно и уверенно, как вежливый дворецкий:"
     stt_lang: str = "ru-RU"
+    mic_sensitivity: float = 1.0
     live_mode: bool = True
     live_model: str = "gemini-2.5-flash-native-audio-latest"
     allow_shell_commands: bool = False
@@ -65,6 +66,7 @@ def load_config() -> Config:
         voice=data.get("voice", Config.voice),
         voice_style=data.get("voice_style", Config.voice_style),
         stt_lang=data.get("stt_lang", Config.stt_lang),
+        mic_sensitivity=float(data.get("mic_sensitivity", Config.mic_sensitivity)),
         live_mode=data.get("live_mode", Config.live_mode),
         live_model=data.get("live_model", Config.live_model),
         allow_shell_commands=data.get("allow_shell_commands", Config.allow_shell_commands),
@@ -120,6 +122,8 @@ def save_config() -> None:
         "",
         "# Язык распознавания речи",
         f'stt_lang = "{_toml_escape(CFG.stt_lang)}"',
+        "# Чувствительность микрофона: 0.25–1.25 (выше = чувствительнее)",
+        f"mic_sensitivity = {max(0.25, min(1.25, CFG.mic_sensitivity)):.2f}",
         "",
         "# Реалтайм голос↔голос (Gemini Live API). false = классический STT→chat→TTS",
         f"live_mode = {'true' if CFG.live_mode else 'false'}",

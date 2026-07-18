@@ -15,14 +15,15 @@ from .config import CFG
 
 SAMPLE_RATE = 16000
 FRAME = 480              # 30 мс — формат, поддерживаемый WebRTC VAD
-MIN_START_RMS = 0.010
+MIN_START_RMS = 0.006
 MAX_SPEECH_SECONDS = 6
-MAX_WAKE_SECONDS = 2.5  # музыка не может занять распознаватель дольше этого
+MAX_WAKE_SECONDS = 1.6  # короткие циклы быстрее находят отдельное «Шарп»
 SILENCE_TAIL = 0.48      # возврат к фону = конец фразы
 START_TIMEOUT = 30.0     # долго держим поток открытым, чтобы редко калиброваться
-PRE_ROLL_SECONDS = 0.36  # сохраняем начало слова перед срабатыванием VAD
-CALIBRATION_SECONDS = 1.0
-TRIGGER_FRAMES = 2       # два речевых кадра подряд защищают от щелчков
+PRE_ROLL_SECONDS = 0.50  # не режем тихое начало слова
+CALIBRATION_SECONDS = 0.45
+TRIGGER_FRAMES = 1       # высокая чувствительность важнее ложного захвата шума
+_noise_rms_estimate: float | None = None
 
 
 def record_until_silence(
@@ -30,6 +31,7 @@ def record_until_silence(
     max_speech_seconds: float = MAX_SPEECH_SECONDS,
 ) -> bytes:
     """Записать фразу до паузы, вернуть PCM s16le 16кГц mono."""
+    global _noise_rms_estimate
     import sounddevice as sd
     import webrtcvad
 
@@ -43,11 +45,14 @@ def record_until_silence(
     speech_elapsed = 0.0
     tail_frames = int(SILENCE_TAIL * SAMPLE_RATE / FRAME)
     start_frames = int(START_TIMEOUT * SAMPLE_RATE / FRAME)
-    calibration_frames = max(3, int(CALIBRATION_SECONDS * SAMPLE_RATE / FRAME))
+    calibration_frames = (
+        max(3, int(CALIBRATION_SECONDS * SAMPLE_RATE / FRAME))
+        if _noise_rms_estimate is None else 0
+    )
     idle_frames = 0
     calibration: list[float] = []
-    noise_rms = MIN_START_RMS / 2
-    vad = webrtcvad.Vad(3)
+    noise_rms = _noise_rms_estimate or MIN_START_RMS / 2
+    vad = webrtcvad.Vad(2)
 
     with sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32",
                         blocksize=FRAME) as stream:
@@ -74,8 +79,11 @@ def record_until_silence(
                     noise_rms = float(np.median(stable))
                 continue
 
-            start_threshold = max(MIN_START_RMS, min(0.45, noise_rms * 1.45 + 0.003))
-            return_threshold = max(MIN_START_RMS * 0.8, noise_rms * 1.20)
+            sensitivity = max(0.25, min(1.25, CFG.mic_sensitivity))
+            start_ratio = max(1.01, 1.50 - 0.40 * sensitivity)
+            return_ratio = max(1.01, 1.25 - 0.15 * sensitivity)
+            start_threshold = max(MIN_START_RMS, min(0.45, noise_rms * start_ratio + 0.001))
+            return_threshold = max(MIN_START_RMS * 0.8, noise_rms * return_ratio)
             is_voice = vad.is_speech(pcm, SAMPLE_RATE) and rms >= start_threshold
 
             if not speech_started:
@@ -103,6 +111,7 @@ def record_until_silence(
                 if quiet_frames >= tail_frames:
                     break
 
+    _noise_rms_estimate = noise_rms
     if not collected:
         return b""
     return b"".join(collected)

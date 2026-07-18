@@ -24,6 +24,7 @@ python3 -m venv .venv
 ```toml
 api_key = "ТВОЙ_КЛЮЧ"
 voice = "Charon"          # 30 голосов: Kore, Puck, Zephyr, Fenrir, Aoede, ...
+mic_sensitivity = 1.0     # 0.25–1.25; выше — чувствительнее
 chat_model = "gemini-3-flash-preview"
 allow_shell_commands = false  # безопасное значение по умолчанию
 ```

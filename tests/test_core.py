@@ -324,6 +324,7 @@ class WakeWordTests(unittest.TestCase):
 
     def test_common_stt_variant_is_accepted_as_whole_word(self) -> None:
         self.assertEqual(extract_command("Шар включи музыку"), "включи музыку")
+        self.assertEqual(extract_command("Шарк открой браузер"), "открой браузер")
         self.assertIsNone(extract_command("возьми шарик"))
 
 
