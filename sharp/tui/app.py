@@ -42,6 +42,8 @@ class SharpApp(App):
         self._busy = threading.Event()
         self._shutdown_event = threading.Event()
         self._live_waiting = threading.Event()
+        self._reconnect_attempt = 0
+        self._reconnect_scheduled = False
         self._mic_worker_started = False
         self._awake_until = 0.0
         self.live = None        # LiveSession, если активен реалтайм-режим
@@ -60,7 +62,7 @@ class SharpApp(App):
         if CFG.live_mode:
             # Не ждём отдельную проверку сети и Google STT: Live подключается
             # сразу, входной PCM идёт в него непрерывным потоком.
-            self._start_live(buffered_playback=True)
+            self._start_live(buffered_playback=False)
         else:
             self._ensure_mic_worker()
             self.set_status(f"SAY {WAKE_WORD.upper()}")
@@ -122,7 +124,7 @@ class SharpApp(App):
         self.call_from_thread(self.set_status, state)
 
     # --- реалтайм голос↔голос (Gemini Live API) ---
-    def _start_live(self, buffered_playback: bool = True) -> None:
+    def _start_live(self, buffered_playback: bool = False) -> None:
         from ..live import LiveSession
         self.mic_on = False  # классический цикл молчит, пока Live активен
         self.live = LiveSession(
@@ -139,13 +141,37 @@ class SharpApp(App):
     def _live_status(self, text: str) -> None:
         self.log_line(f"[#707070]SYS[/]   {escape(text)}")
         if text.startswith("Live-режим активен"):
+            self._reconnect_attempt = 0
+            self._reconnect_scheduled = False
             self.set_status("LISTENING LIVE")
         elif text.startswith(("Слабая сеть: загружаю", "Сеть просела:")):
             self.set_status("BUFFERING AUDIO")
         elif text.startswith("Голосовой ответ загружен"):
             self.set_status("SPEAKING")
-        elif text.startswith(("Обрыв Live", "Live-сессия завершилась")):
-            self._fallback_to_classic("Live отключён, включён классический голосовой режим.")
+        elif text.startswith(("Обрыв", "Live-сессия завершилась", "Микрофон недоступен",
+                              "Вывод звука недоступен", "Ошибка воспроизведения")):
+            self._fallback_to_classic("Live оборвался — временно включён классический режим.")
+            self._schedule_live_reconnect()
+
+    def _schedule_live_reconnect(self) -> None:
+        if self._reconnect_scheduled or not CFG.live_mode or self._shutdown_event.is_set():
+            return
+        self._reconnect_scheduled = True
+        self._reconnect_attempt += 1
+        delay = min(30.0, 2.0 ** min(self._reconnect_attempt, 5))
+        self.log_line(f"[#707070]SYS[/]   Переподключение Live через {delay:.0f} с.")
+
+        def retry() -> None:
+            if self._shutdown_event.wait(delay):
+                return
+            self.call_from_thread(self._retry_live)
+
+        self.run_worker(retry, exclusive=False, thread=True)
+
+    def _retry_live(self) -> None:
+        self._reconnect_scheduled = False
+        if CFG.live_mode and not self.live and not self._shutdown_event.is_set():
+            self._start_live(buffered_playback=False)
 
     def _fallback_to_classic(self, message: str) -> None:
         self._live_waiting.clear()

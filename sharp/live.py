@@ -12,7 +12,9 @@ from __future__ import annotations
 import asyncio
 import queue
 import threading
-from typing import Callable
+import time
+from collections.abc import Callable
+from contextlib import suppress
 
 import numpy as np
 from google import genai
@@ -27,8 +29,9 @@ LIVE_MODEL = "gemini-2.5-flash-native-audio-latest"
 # Форматы PCM: вход в модель — 16кГц, выход из модели — 24кГц, оба mono s16le.
 IN_RATE = 16000
 OUT_RATE = 24000
-IN_BLOCK = 1600          # 100мс кадр микрофона
+IN_BLOCK = 640           # 40 мс: низкая задержка без чрезмерного сетевого overhead
 OUT_BLOCK = 1024
+STREAM_PREBUFFER_MS = 240
 
 # Для разговорного стриминга даже четверть секунды на TLS handshake уже много.
 # При 200+ мс Live остаётся активным, но ответ сначала загружается целиком.
@@ -53,9 +56,11 @@ def network_ok(limit_ms: float = NET_PROBE_LIMIT_MS) -> tuple[bool, float]:
     for _ in range(2):
         t0 = _t.monotonic()
         try:
-            with socket.create_connection((host, 443), timeout=2.0) as sock:
-                with ctx.wrap_socket(sock, server_hostname=host):
-                    pass
+            with (
+                socket.create_connection((host, 443), timeout=2.0) as sock,
+                ctx.wrap_socket(sock, server_hostname=host),
+            ):
+                pass
         except OSError:
             continue
         ms = (_t.monotonic() - t0) * 1000.0
@@ -90,6 +95,8 @@ class LiveSession:
         # Sharp, а затем автоматически возвращает прежнее состояние.
         self._speaking = threading.Event()
         self._response_complete = threading.Event()
+        self._playback_started = threading.Event()
+        self._failure_reported = threading.Event()
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stop_async: asyncio.Event | None = None
         self._session = None
@@ -98,8 +105,8 @@ class LiveSession:
         self._mic_thread: threading.Thread | None = None
 
         # очереди PCM: микрофон → модель, модель → динамики
-        self._mic_q: "queue.Queue[bytes | None]" = queue.Queue(maxsize=32)
-        self._play_q: "queue.Queue[bytes | None]" = queue.Queue(maxsize=96)
+        self._mic_q: queue.Queue[bytes | None] = queue.Queue(maxsize=64)
+        self._play_q: queue.Queue[bytes | None] = queue.Queue(maxsize=96)
         # накопители транскрипций (флашим по границам реплик)
         self._in_buf = ""
         self._out_buf = ""
@@ -116,8 +123,11 @@ class LiveSession:
         self._running = False
         self._put_stop_marker(self._mic_q)
         self._put_stop_marker(self._play_q)
-        if self._loop and self._stop_async:
-            self._loop.call_soon_threadsafe(self._stop_async.set)
+        if self._stop_async:
+            if self._loop:
+                self._loop.call_soon_threadsafe(self._stop_async.set)
+            else:
+                self._stop_async.set()
         if self._thread and self._thread is not threading.current_thread():
             self._thread.join(timeout=2.0)
         for worker in (self._mic_thread, self._play_thread):
@@ -158,6 +168,22 @@ class LiveSession:
         """Вернуть микрофон в выбранное пользователем состояние."""
         self._speaking.clear()
         self._response_complete.clear()
+        self._playback_started.clear()
+
+    def _fail(self, message: str) -> None:
+        """Остановить все части Live после первой зафиксированной ошибки."""
+        if not self._running or self._failure_reported.is_set():
+            return
+        self._failure_reported.set()
+        self.on_status(message)
+        self._running = False
+        self._put_stop_marker(self._mic_q)
+        self._put_stop_marker(self._play_q)
+        if self._stop_async:
+            if self._loop:
+                self._loop.call_soon_threadsafe(self._stop_async.set)
+            else:
+                self._stop_async.set()
 
     def send_text(self, text: str) -> bool:
         """Отправить набранный текст в ту же live-сессию (потокобезопасно)."""
@@ -234,10 +260,8 @@ class LiveSession:
             if not self._can_capture_mic():
                 return
             pcm = (np.clip(indata[:, 0], -1, 1) * 32767).astype(np.int16).tobytes()
-            try:
+            with suppress(queue.Full):
                 self._mic_q.put_nowait(pcm)
-            except queue.Full:
-                pass
 
         try:
             with sd.InputStream(samplerate=IN_RATE, channels=1, dtype="float32",
@@ -245,7 +269,7 @@ class LiveSession:
                 while self._running:
                     sd.sleep(100)
         except Exception as e:  # noqa: BLE001
-            self.on_status(f"Микрофон недоступен: {str(e)[:80]}")
+            self._fail(f"Микрофон недоступен: {str(e)[:80]}")
 
     async def _sender(self) -> None:
         """Достаём кадры микрофона из очереди и шлём в модель."""
@@ -265,7 +289,8 @@ class LiveSession:
                 await self._session.send_realtime_input(
                     audio=types.Blob(data=pcm, mime_type=f"audio/pcm;rate={IN_RATE}")
                 )
-            except Exception:  # noqa: BLE001
+            except Exception as error:  # noqa: BLE001
+                self._fail(f"Обрыв отправки Live: {str(error)[:80]}")
                 break
         if self._stop_async:
             self._stop_async.set()
@@ -309,10 +334,7 @@ class LiveSession:
                         self._response_complete.set()
                         self._flush_transcripts()
             except Exception as e:  # noqa: BLE001
-                if self._running:
-                    self.on_status(f"Обрыв Live: {str(e)[:80]}")
-                if self._stop_async:
-                    self._stop_async.set()
+                self._fail(f"Обрыв Live: {str(e)[:80]}")
                 break
 
     def _queue_audio(self, chunk: bytes) -> None:
@@ -336,10 +358,8 @@ class LiveSession:
                 types.FunctionResponse(id=fc.id, name=fc.name, response=result)
             )
         if responses and self._session:
-            try:
+            with suppress(Exception):  # noqa: BLE001
                 await self._session.send_tool_response(function_responses=responses)
-            except Exception:  # noqa: BLE001
-                pass
 
     def _flush_transcripts(self) -> None:
         if self._in_buf.strip():
@@ -372,7 +392,7 @@ class LiveSession:
                                      blocksize=OUT_BLOCK)
             stream.start()
         except Exception as e:  # noqa: BLE001
-            self.on_status(f"Вывод звука недоступен: {str(e)[:80]}")
+            self._fail(f"Вывод звука недоступен: {str(e)[:80]}")
             return
 
         stalls = 0  # «спотыкания»: очередь пуста посреди ответа = сеть не успевает
@@ -402,22 +422,46 @@ class LiveSession:
             if chunk is None:
                 break
             stalls = 0
-            samples = np.frombuffer(chunk, dtype=np.int16).astype(np.float32) / 32768.0
+            chunks = [chunk]
+            # Первый звук придерживаем максимум на 240 мс: этого достаточно,
+            # чтобы сгладить сетевой jitter, но короткий завершённый ответ идёт сразу.
+            if not self.buffered_playback and not self._playback_started.is_set():
+                target_bytes = int(OUT_RATE * 2 * STREAM_PREBUFFER_MS / 1000)
+                buffered_bytes = len(chunk)
+                deadline = time.monotonic() + STREAM_PREBUFFER_MS / 1000
+                while (
+                    buffered_bytes < target_bytes
+                    and not self._response_complete.is_set()
+                    and time.monotonic() < deadline
+                    and self._running
+                ):
+                    try:
+                        extra = self._play_q.get(timeout=0.04)
+                    except queue.Empty:
+                        continue
+                    if extra is None:
+                        self._running = False
+                        break
+                    chunks.append(extra)
+                    buffered_bytes += len(extra)
+                self._playback_started.set()
             audio._playing.set()
             try:
                 # Пишем по блокам: большой буфер воспроизводится плавно, а
                 # визуализатор остаётся синхронным со звуком.
-                for i in range(0, samples.size, OUT_BLOCK):
-                    block = samples[i : i + OUT_BLOCK]
-                    audio._push_levels(audio._bands_from_block(block))
-                    stream.write(block.reshape(-1, 1))
-            except Exception:  # noqa: BLE001
+                for pcm in chunks:
+                    samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float32) / 32768.0
+                    for i in range(0, samples.size, OUT_BLOCK):
+                        block = samples[i : i + OUT_BLOCK]
+                        audio._push_levels(audio._bands_from_block(block))
+                        stream.write(block.reshape(-1, 1))
+            except Exception as error:  # noqa: BLE001
+                self._fail(f"Ошибка воспроизведения Live: {str(error)[:80]}")
                 break
 
         audio._playing.clear()
         self._end_speaking()
         audio._push_levels(np.zeros(audio.NUM_BANDS, dtype=np.float32))
-        try:
-            stream.stop(); stream.close()
-        except Exception:  # noqa: BLE001
-            pass
+        with suppress(Exception):  # noqa: BLE001
+            stream.stop()
+            stream.close()

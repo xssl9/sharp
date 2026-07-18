@@ -17,7 +17,7 @@ from sharp.commands import (
     run_shell,
     run_terminal,
 )
-from sharp.live import LiveSession
+from sharp.live import IN_BLOCK, IN_RATE, STREAM_PREBUFFER_MS, LiveSession
 from sharp.storage import atomic_write_json
 from sharp.stt import _transcripts_from_google, listen_candidates
 from sharp.tools import LIVE_SYSTEM_PROMPT
@@ -199,6 +199,21 @@ class YandexMusicTests(unittest.TestCase):
 
 
 class LiveSessionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_live_audio_uses_low_latency_frames_and_small_jitter_buffer(self) -> None:
+        self.assertEqual(IN_BLOCK / IN_RATE, 0.04)
+        self.assertLessEqual(STREAM_PREBUFFER_MS, 250)
+
+    async def test_runtime_failure_is_reported_only_once(self) -> None:
+        statuses: list[str] = []
+        live = LiveSession(lambda _: None, lambda _: None, statuses.append)
+        live._running = True
+
+        live._fail("first")
+        live._fail("second")
+
+        self.assertEqual(statuses, ["first"])
+        self.assertFalse(live._running)
+
     async def test_live_prompt_requires_wake_word_for_new_commands(self) -> None:
         self.assertIn("Если во входной реплике нет слова", LIVE_SYSTEM_PROMPT)
         self.assertIn("не вызывай инструменты", LIVE_SYSTEM_PROMPT)
