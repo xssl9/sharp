@@ -94,6 +94,8 @@ class LiveSession:
         self._stop_async: asyncio.Event | None = None
         self._session = None
         self._thread: threading.Thread | None = None
+        self._play_thread: threading.Thread | None = None
+        self._mic_thread: threading.Thread | None = None
 
         # очереди PCM: микрофон → модель, модель → динамики
         self._mic_q: "queue.Queue[bytes | None]" = queue.Queue(maxsize=32)
@@ -118,6 +120,9 @@ class LiveSession:
             self._loop.call_soon_threadsafe(self._stop_async.set)
         if self._thread and self._thread is not threading.current_thread():
             self._thread.join(timeout=2.0)
+        for worker in (self._mic_thread, self._play_thread):
+            if worker and worker is not threading.current_thread():
+                worker.join(timeout=2.0)
 
     @staticmethod
     def _put_stop_marker(target: queue.Queue) -> None:
@@ -203,13 +208,13 @@ class LiveSession:
             self._session = session
             self.on_status(f"Live-режим активен ({CFG.voice}). Говорите, сэр.")
             # воспроизведение — в отдельном потоке (blocking sounddevice)
-            play_thread = threading.Thread(target=self._player, daemon=True)
-            play_thread.start()
+            self._play_thread = threading.Thread(target=self._player, daemon=True)
+            self._play_thread.start()
             # В TUI вход сначала проходит локальный wake-word фильтр. Прямой
             # аудиозахват оставлен для программного использования LiveSession.
             if self.capture_audio:
-                mic_thread = threading.Thread(target=self._mic_reader, daemon=True)
-                mic_thread.start()
+                self._mic_thread = threading.Thread(target=self._mic_reader, daemon=True)
+                self._mic_thread.start()
             sender = asyncio.create_task(self._sender())
             receiver = asyncio.create_task(self._receiver())
             try:

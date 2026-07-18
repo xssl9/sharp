@@ -20,6 +20,7 @@ from sharp.commands import (
 from sharp.live import LiveSession
 from sharp.storage import atomic_write_json
 from sharp.stt import _transcripts_from_google, listen_candidates
+from sharp.tools import LIVE_SYSTEM_PROMPT
 from sharp.wake import extract_command
 
 
@@ -198,6 +199,27 @@ class YandexMusicTests(unittest.TestCase):
 
 
 class LiveSessionTests(unittest.IsolatedAsyncioTestCase):
+    async def test_live_prompt_requires_wake_word_for_new_commands(self) -> None:
+        self.assertIn("Если во входной реплике нет слова", LIVE_SYSTEM_PROMPT)
+        self.assertIn("не вызывай инструменты", LIVE_SYSTEM_PROMPT)
+
+    async def test_stop_joins_audio_workers(self) -> None:
+        class Worker:
+            def __init__(self) -> None:
+                self.joined = False
+
+            def join(self, timeout: float) -> None:
+                self.joined = timeout == 2.0
+
+        live = LiveSession(lambda _: None, lambda _: None, lambda _: None)
+        live._mic_thread = Worker()
+        live._play_thread = Worker()
+
+        live.stop()
+
+        self.assertTrue(live._mic_thread.joined)
+        self.assertTrue(live._play_thread.joined)
+
     async def test_mic_is_temporarily_suspended_while_sharp_speaks(self) -> None:
         live = LiveSession(lambda _: None, lambda _: None, lambda _: None)
         live._running = True

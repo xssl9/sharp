@@ -58,26 +58,12 @@ class SharpApp(App):
     def on_mount(self) -> None:
         self.query_one("#input", Input).focus()
         if CFG.live_mode:
-            self.set_status("PROBING NET")
-            self._ensure_mic_worker()
-            self.run_worker(self._probe_and_start, exclusive=False, thread=True)
+            # Не ждём отдельную проверку сети и Google STT: Live подключается
+            # сразу, входной PCM идёт в него непрерывным потоком.
+            self._start_live(buffered_playback=True)
         else:
             self._ensure_mic_worker()
             self.set_status(f"SAY {WAKE_WORD.upper()}")
-
-    def _probe_and_start(self) -> None:
-        """Проба сети выбирает потоковое или буферное воспроизведение Live."""
-        from ..live import network_ok
-        ok, ms = network_ok()
-        shown = f"{ms:.0f}мс" if ms != float("inf") else "нет сети"
-        if ok:
-            self.call_from_thread(self.log_line, f"[#707070]SYS[/]   Сеть быстрая ({shown}) — Live-режим.")
-            self.call_from_thread(self._start_live, False)
-        else:
-            self.call_from_thread(self.log_line,
-                                  f"[#707070]SYS[/]   Сеть слабая ({shown}) — Live с полной "
-                                  "загрузкой ответа перед воспроизведением.")
-            self.call_from_thread(self._start_live, True)
 
     def set_status(self, state: str) -> None:
         self.query_one("#status", Static).update(state)
@@ -97,6 +83,12 @@ class SharpApp(App):
         self._live_waiting.clear()
         self._awake_until = time.monotonic() + DIALOG_WINDOW_SECONDS
         self.log_message("sharp", text)
+
+    def _log_live_user(self, text: str) -> None:
+        """Hide ambient transcripts; show addressed commands and active follow-ups."""
+        if extract_command(text) is not None or time.monotonic() < self._awake_until:
+            self._awake_until = time.monotonic() + DIALOG_WINDOW_SECONDS
+            self.log_message("voice", text)
 
     def _acknowledge_wake(self) -> None:
         """Instant local acknowledgement; no Gemini/network round trip."""
@@ -130,14 +122,14 @@ class SharpApp(App):
         self.call_from_thread(self.set_status, state)
 
     # --- реалтайм голос↔голос (Gemini Live API) ---
-    def _start_live(self, buffered_playback: bool = False) -> None:
+    def _start_live(self, buffered_playback: bool = True) -> None:
         from ..live import LiveSession
         self.mic_on = False  # классический цикл молчит, пока Live активен
         self.live = LiveSession(
-            on_user_text=lambda t: self.call_from_thread(self.log_message, "voice", t),
+            on_user_text=lambda t: self.call_from_thread(self._log_live_user, t),
             on_sharp_text=lambda t: self.call_from_thread(self._log_live_reply, t),
             on_status=lambda t: self.call_from_thread(self._live_status, t),
-            capture_audio=False,
+            capture_audio=True,
             buffered_playback=buffered_playback,
         )
         self.set_status("CONNECTING")
@@ -147,9 +139,7 @@ class SharpApp(App):
     def _live_status(self, text: str) -> None:
         self.log_line(f"[#707070]SYS[/]   {escape(text)}")
         if text.startswith("Live-режим активен"):
-            self.mic_on = True
-            self._ensure_mic_worker()
-            self.set_status(f"SAY {WAKE_WORD.upper()}")
+            self.set_status("LISTENING LIVE")
         elif text.startswith(("Слабая сеть: загружаю", "Сеть просела:")):
             self.set_status("BUFFERING AUDIO")
         elif text.startswith("Голосовой ответ загружен"):
@@ -287,7 +277,8 @@ class SharpApp(App):
                 self.log_line("[#d29922]Классический режим (STT→chat→TTS). "
                               "Микрофон-цикл включён, Ctrl+K — вкл/выкл.")
                 self.mic_on = True
-                self.set_status("LISTENING")
+                self._ensure_mic_worker()
+                self.set_status(f"SAY {WAKE_WORD.upper()}")
             else:
                 CFG.live_mode = True
                 config.save_config()
@@ -349,6 +340,9 @@ class SharpApp(App):
                 time.sleep(0.2)
                 continue
             live = self.live
+            if live and live.capture_audio:
+                time.sleep(0.2)
+                continue
             if live and live.speaking_event.is_set():
                 time.sleep(0.1)
                 continue
@@ -410,9 +404,8 @@ class SharpApp(App):
 
     def action_listen(self) -> None:
         if self.live:
-            self.mic_on = not self.mic_on
-            on = self.mic_on
-            self.set_status(f"SAY {WAKE_WORD.upper()}" if on else "MIC PAUSED")
+            on = self.live.toggle_mic()
+            self.set_status("LISTENING LIVE" if on else "MIC PAUSED")
             self.log_line(f"[#d29922]Микрофон {'включён — говорите' if on else 'на паузе'}.")
             return
         self.mic_on = not self.mic_on
