@@ -17,7 +17,15 @@ from sharp.commands import (
     run_shell,
     run_terminal,
 )
-from sharp.live import IN_BLOCK, IN_RATE, STREAM_PREBUFFER_MS, LiveSession
+from sharp.live import (
+    IN_BLOCK,
+    IN_RATE,
+    LIVE_MAX_OUTPUT_TOKENS,
+    LIVE_VAD_SILENCE_MS,
+    STREAM_PREBUFFER_MS,
+    LiveSession,
+    build_live_config,
+)
 from sharp.storage import atomic_write_json
 from sharp.stt import _transcripts_from_google, listen_candidates
 from sharp.tools import LIVE_SYSTEM_PROMPT
@@ -200,8 +208,17 @@ class YandexMusicTests(unittest.TestCase):
 
 class LiveSessionTests(unittest.IsolatedAsyncioTestCase):
     async def test_live_audio_uses_low_latency_frames_and_small_jitter_buffer(self) -> None:
-        self.assertEqual(IN_BLOCK / IN_RATE, 0.04)
-        self.assertLessEqual(STREAM_PREBUFFER_MS, 250)
+        self.assertEqual(IN_BLOCK / IN_RATE, 0.02)
+        self.assertLessEqual(STREAM_PREBUFFER_MS, 100)
+
+    async def test_live_config_uses_fast_turn_detection(self) -> None:
+        cfg = build_live_config("system")
+        vad = cfg.realtime_input_config.automatic_activity_detection
+
+        self.assertEqual(vad.silence_duration_ms, LIVE_VAD_SILENCE_MS)
+        self.assertLessEqual(vad.silence_duration_ms, 300)
+        self.assertEqual(cfg.thinking_config.thinking_budget, 0)
+        self.assertLessEqual(cfg.generation_config.max_output_tokens, LIVE_MAX_OUTPUT_TOKENS)
 
     async def test_runtime_failure_is_reported_only_once(self) -> None:
         statuses: list[str] = []

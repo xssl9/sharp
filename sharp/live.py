@@ -29,15 +29,49 @@ LIVE_MODEL = "gemini-2.5-flash-native-audio-latest"
 # Форматы PCM: вход в модель — 16кГц, выход из модели — 24кГц, оба mono s16le.
 IN_RATE = 16000
 OUT_RATE = 24000
-IN_BLOCK = 640           # 40 мс: низкая задержка без чрезмерного сетевого overhead
+IN_BLOCK = 320           # 20 мс: быстрее доходит до серверного VAD
 OUT_BLOCK = 1024
-STREAM_PREBUFFER_MS = 240
+STREAM_PREBUFFER_MS = 90
+LIVE_VAD_PREFIX_PADDING_MS = 80
+LIVE_VAD_SILENCE_MS = 250
+LIVE_MAX_OUTPUT_TOKENS = 80
 
 # Для разговорного стриминга даже четверть секунды на TLS handshake уже много.
 # При 200+ мс Live остаётся активным, но ответ сначала загружается целиком.
 NET_PROBE_LIMIT_MS = 200.0
 # Сколько «спотыканий» (пустая очередь ≥0.3с посреди ответа) терпим в одном ответе.
 STALL_LIMIT = 3
+
+
+def build_live_config(system_instruction: str) -> types.LiveConnectConfig:
+    """Fast voice profile: short turns, aggressive VAD, no model thinking delay."""
+    return types.LiveConnectConfig(
+        response_modalities=["AUDIO"],
+        generation_config=types.GenerationConfig(
+            max_output_tokens=LIVE_MAX_OUTPUT_TOKENS,
+            temperature=0.35,
+        ),
+        thinking_config=types.ThinkingConfig(thinking_budget=0),
+        realtime_input_config=types.RealtimeInputConfig(
+            automatic_activity_detection=types.AutomaticActivityDetection(
+                start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_HIGH,
+                end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_HIGH,
+                prefix_padding_ms=LIVE_VAD_PREFIX_PADDING_MS,
+                silence_duration_ms=LIVE_VAD_SILENCE_MS,
+            ),
+            activity_handling=types.ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
+            turn_coverage=types.TurnCoverage.TURN_INCLUDES_ONLY_ACTIVITY,
+        ),
+        system_instruction=system_instruction,
+        input_audio_transcription=types.AudioTranscriptionConfig(),
+        output_audio_transcription=types.AudioTranscriptionConfig(),
+        tools=[tools.gemini_tool()],
+        speech_config=types.SpeechConfig(
+            voice_config=types.VoiceConfig(
+                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=CFG.voice)
+            )
+        ),
+    )
 
 
 def network_ok(limit_ms: float = NET_PROBE_LIMIT_MS) -> tuple[bool, float]:
@@ -97,6 +131,8 @@ class LiveSession:
         self._response_complete = threading.Event()
         self._playback_started = threading.Event()
         self._failure_reported = threading.Event()
+        self._last_voice_at = 0.0
+        self._first_audio_reported = False
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stop_async: asyncio.Event | None = None
         self._session = None
@@ -169,6 +205,7 @@ class LiveSession:
         self._speaking.clear()
         self._response_complete.clear()
         self._playback_started.clear()
+        self._first_audio_reported = False
 
     def _fail(self, message: str) -> None:
         """Остановить все части Live после первой зафиксированной ошибки."""
@@ -218,18 +255,7 @@ class LiveSession:
         self._loop = asyncio.get_running_loop()
         self._stop_async = asyncio.Event()
         client = genai.Client(api_key=CFG.require_key())
-        cfg = types.LiveConnectConfig(
-            response_modalities=["AUDIO"],
-            system_instruction=tools.LIVE_SYSTEM_PROMPT + memory.as_prompt(),
-            input_audio_transcription=types.AudioTranscriptionConfig(),
-            output_audio_transcription=types.AudioTranscriptionConfig(),
-            tools=[tools.gemini_tool()],
-            speech_config=types.SpeechConfig(
-                voice_config=types.VoiceConfig(
-                    prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=CFG.voice)
-                )
-            ),
-        )
+        cfg = build_live_config(tools.LIVE_SYSTEM_PROMPT + memory.as_prompt())
         async with client.aio.live.connect(model=CFG.live_model, config=cfg) as session:
             self._session = session
             self.on_status(f"Live-режим активен ({CFG.voice}). Говорите, сэр.")
@@ -259,6 +285,9 @@ class LiveSession:
         def cb(indata, frames, time, status):  # noqa: ANN001, ARG001
             if not self._can_capture_mic():
                 return
+            rms = float(np.sqrt(np.mean(indata[:, 0] ** 2)))
+            if rms >= 0.01:
+                self._last_voice_at = time.monotonic()
             pcm = (np.clip(indata[:, 0], -1, 1) * 32767).astype(np.int16).tobytes()
             with suppress(queue.Full):
                 self._mic_q.put_nowait(pcm)
@@ -308,6 +337,11 @@ class LiveSession:
                     if r.tool_call:
                         await self._handle_tool_call(r.tool_call)
                     if r.data:
+                        if not self._first_audio_reported:
+                            self._first_audio_reported = True
+                            if self._last_voice_at > 0:
+                                delay_ms = (time.monotonic() - self._last_voice_at) * 1000
+                                self.on_status(f"LATENCY first_audio={delay_ms:.0f}ms")
                         if self.buffered_playback:
                             buffered_audio.append(r.data)
                             if not buffering_announced:
