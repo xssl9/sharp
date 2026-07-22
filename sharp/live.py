@@ -32,7 +32,7 @@ OUT_RATE = 24000
 IN_BLOCK = 640           # 40 ms: stable realtime capture on PipeWire/ALSA
 OUT_BLOCK = 1024
 STREAM_PREBUFFER_MS = 90
-LIVE_MAX_OUTPUT_TOKENS = 80
+LIVE_MAX_OUTPUT_TOKENS = 160
 
 # Для разговорного стриминга даже четверть секунды на TLS handshake уже много.
 # При 200+ мс Live остаётся активным, но ответ сначала загружается целиком.

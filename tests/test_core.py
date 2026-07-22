@@ -215,7 +215,8 @@ class LiveSessionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNone(cfg.realtime_input_config)
         self.assertEqual(cfg.thinking_config.thinking_budget, 0)
-        self.assertLessEqual(cfg.generation_config.max_output_tokens, LIVE_MAX_OUTPUT_TOKENS)
+        self.assertEqual(cfg.generation_config.max_output_tokens, LIVE_MAX_OUTPUT_TOKENS)
+        self.assertGreaterEqual(LIVE_MAX_OUTPUT_TOKENS, 140)
 
     async def test_runtime_failure_is_reported_only_once(self) -> None:
         statuses: list[str] = []
@@ -234,6 +235,7 @@ class LiveSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("не вызывай инструменты", LIVE_SYSTEM_PROMPT)
         self.assertIn("даже «молчу»", LIVE_SYSTEM_PROMPT)
         self.assertIn("«шарк»", LIVE_SYSTEM_PROMPT)
+        self.assertIn("не обрывай речь", LIVE_SYSTEM_PROMPT)
 
     async def test_stop_joins_audio_workers(self) -> None:
         class Worker:
