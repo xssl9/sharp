@@ -29,7 +29,7 @@ LIVE_MODEL = "gemini-2.5-flash-native-audio-latest"
 # Форматы PCM: вход в модель — 16кГц, выход из модели — 24кГц, оба mono s16le.
 IN_RATE = 16000
 OUT_RATE = 24000
-IN_BLOCK = 320           # 20 мс: быстрее доходит до серверного VAD
+IN_BLOCK = 640           # 40 ms: stable realtime capture on PipeWire/ALSA
 OUT_BLOCK = 1024
 STREAM_PREBUFFER_MS = 90
 LIVE_MAX_OUTPUT_TOKENS = 80
@@ -120,6 +120,7 @@ class LiveSession:
         self._playback_started = threading.Event()
         self._failure_reported = threading.Event()
         self._last_voice_at = 0.0
+        self._next_mic_status_at = 0.0
         self._first_audio_reported = False
         self._loop: asyncio.AbstractEventLoop | None = None
         self._stop_async: asyncio.Event | None = None
@@ -270,12 +271,15 @@ class LiveSession:
     def _mic_reader(self) -> None:
         import sounddevice as sd
 
-        def cb(indata, frames, time, status):  # noqa: ANN001, ARG001
+        def cb(indata, frames, time_info, status):  # noqa: ANN001, ARG001
             if not self._can_capture_mic():
                 return
             rms = float(np.sqrt(np.mean(indata[:, 0] ** 2)))
-            if rms >= 0.01:
+            if rms >= 0.006:
                 self._last_voice_at = time.monotonic()
+                if self._last_voice_at >= self._next_mic_status_at:
+                    self._next_mic_status_at = self._last_voice_at + 2.0
+                    self.on_status("Live слышу микрофон.")
             pcm = (np.clip(indata[:, 0], -1, 1) * 32767).astype(np.int16).tobytes()
             with suppress(queue.Full):
                 self._mic_q.put_nowait(pcm)

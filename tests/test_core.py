@@ -207,7 +207,7 @@ class YandexMusicTests(unittest.TestCase):
 
 class LiveSessionTests(unittest.IsolatedAsyncioTestCase):
     async def test_live_audio_uses_low_latency_frames_and_small_jitter_buffer(self) -> None:
-        self.assertEqual(IN_BLOCK / IN_RATE, 0.02)
+        self.assertEqual(IN_BLOCK / IN_RATE, 0.04)
         self.assertLessEqual(STREAM_PREBUFFER_MS, 100)
 
     async def test_live_config_keeps_server_default_turn_detection(self) -> None:
@@ -229,8 +229,11 @@ class LiveSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(live._running)
 
     async def test_live_prompt_requires_wake_word_for_new_commands(self) -> None:
-        self.assertIn("Если во входной реплике нет слова", LIVE_SYSTEM_PROMPT)
+        self.assertIn("Если во входной реплике нет", LIVE_SYSTEM_PROMPT)
+        self.assertIn("обращения", LIVE_SYSTEM_PROMPT)
         self.assertIn("не вызывай инструменты", LIVE_SYSTEM_PROMPT)
+        self.assertIn("даже «молчу»", LIVE_SYSTEM_PROMPT)
+        self.assertIn("«шарк»", LIVE_SYSTEM_PROMPT)
 
     async def test_stop_joins_audio_workers(self) -> None:
         class Worker:

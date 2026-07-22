@@ -146,6 +146,8 @@ class SharpApp(App):
             self.set_status("LISTENING LIVE")
         elif text.startswith(("Слабая сеть: загружаю", "Сеть просела:")):
             self.set_status("BUFFERING AUDIO")
+        elif text.startswith("Live слышу микрофон"):
+            self.set_status("HEARING LIVE")
         elif text.startswith("Голосовой ответ загружен"):
             self.set_status("SPEAKING")
         elif text.startswith(("Обрыв", "Live-сессия завершилась", "Микрофон недоступен",
