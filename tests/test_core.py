@@ -21,7 +21,6 @@ from sharp.live import (
     IN_BLOCK,
     IN_RATE,
     LIVE_MAX_OUTPUT_TOKENS,
-    LIVE_VAD_SILENCE_MS,
     STREAM_PREBUFFER_MS,
     LiveSession,
     build_live_config,
@@ -211,12 +210,10 @@ class LiveSessionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(IN_BLOCK / IN_RATE, 0.02)
         self.assertLessEqual(STREAM_PREBUFFER_MS, 100)
 
-    async def test_live_config_uses_fast_turn_detection(self) -> None:
+    async def test_live_config_keeps_server_default_turn_detection(self) -> None:
         cfg = build_live_config("system")
-        vad = cfg.realtime_input_config.automatic_activity_detection
 
-        self.assertEqual(vad.silence_duration_ms, LIVE_VAD_SILENCE_MS)
-        self.assertLessEqual(vad.silence_duration_ms, 300)
+        self.assertIsNone(cfg.realtime_input_config)
         self.assertEqual(cfg.thinking_config.thinking_budget, 0)
         self.assertLessEqual(cfg.generation_config.max_output_tokens, LIVE_MAX_OUTPUT_TOKENS)
 

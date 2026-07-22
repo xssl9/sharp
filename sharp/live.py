@@ -32,8 +32,6 @@ OUT_RATE = 24000
 IN_BLOCK = 320           # 20 мс: быстрее доходит до серверного VAD
 OUT_BLOCK = 1024
 STREAM_PREBUFFER_MS = 90
-LIVE_VAD_PREFIX_PADDING_MS = 80
-LIVE_VAD_SILENCE_MS = 250
 LIVE_MAX_OUTPUT_TOKENS = 80
 
 # Для разговорного стриминга даже четверть секунды на TLS handshake уже много.
@@ -44,7 +42,7 @@ STALL_LIMIT = 3
 
 
 def build_live_config(system_instruction: str) -> types.LiveConnectConfig:
-    """Fast voice profile: short turns, aggressive VAD, no model thinking delay."""
+    """Fast voice profile with SDK-default Live turn detection."""
     return types.LiveConnectConfig(
         response_modalities=["AUDIO"],
         generation_config=types.GenerationConfig(
@@ -52,16 +50,6 @@ def build_live_config(system_instruction: str) -> types.LiveConnectConfig:
             temperature=0.35,
         ),
         thinking_config=types.ThinkingConfig(thinking_budget=0),
-        realtime_input_config=types.RealtimeInputConfig(
-            automatic_activity_detection=types.AutomaticActivityDetection(
-                start_of_speech_sensitivity=types.StartSensitivity.START_SENSITIVITY_HIGH,
-                end_of_speech_sensitivity=types.EndSensitivity.END_SENSITIVITY_HIGH,
-                prefix_padding_ms=LIVE_VAD_PREFIX_PADDING_MS,
-                silence_duration_ms=LIVE_VAD_SILENCE_MS,
-            ),
-            activity_handling=types.ActivityHandling.START_OF_ACTIVITY_INTERRUPTS,
-            turn_coverage=types.TurnCoverage.TURN_INCLUDES_ONLY_ACTIVITY,
-        ),
         system_instruction=system_instruction,
         input_audio_transcription=types.AudioTranscriptionConfig(),
         output_audio_transcription=types.AudioTranscriptionConfig(),
@@ -295,6 +283,7 @@ class LiveSession:
         try:
             with sd.InputStream(samplerate=IN_RATE, channels=1, dtype="float32",
                                 blocksize=IN_BLOCK, callback=cb):
+                self.on_status("Live-микрофон открыт.")
                 while self._running:
                     sd.sleep(100)
         except Exception as e:  # noqa: BLE001
